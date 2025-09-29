@@ -4,7 +4,7 @@
   "ssl_cert_file": "",
   "ssl_key_file": "",
   "secret": "change-this-long-random-secret-please",
-  "logfile": "/var/log/mmbb/config-manager.log",
+  "logfile": "/var/log/config-manager.log",
   "backupDir": "./backup",
   "tmpDir": "./tmp",
   "apply_meta": 0,
