@@ -1,0 +1,25 @@
+{
+  "nginx_conf": {
+    "path": "/etc/nginx/nginx.conf",
+    "category": "service",
+    "service": "nginx",
+    "actions": {
+      "status": [],
+      "reload": []
+    },
+    "user": "root",
+    "group": "root",
+    "mode": "0644",
+    "apply_meta": true
+  },
+  "app_env": {
+    "path": "/opt/configs/app.env",
+    "category": "uncategorized",
+    "actions": {
+      "run": []
+    },
+    "user": "root",
+    "group": "root",
+    "mode": "0640"
+  }
+}

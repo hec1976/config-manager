@@ -1,0 +1,17 @@
+[Unit]
+Description=Config Manager REST API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/config-manager
+ExecStart=/opt/config-manager/bin/config-manager.pl daemon -l http://0.0.0.0:8080
+Restart=on-failure
+Environment=PERL5LIB=/usr/local/lib/perl5
+# Optional: pass API token
+Environment=API_TOKEN=changeme
+
+[Install]
+WantedBy=multi-user.target

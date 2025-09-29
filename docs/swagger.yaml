@@ -1,0 +1,149 @@
+openapi: 3.0.3
+info:
+  title: Config Manager API
+  version: "1.6.1"
+servers:
+  - url: http://localhost:8080
+paths:
+  /:
+    get:
+      summary: Ping
+      responses:
+        "200":
+          description: OK
+  /configs:
+    get:
+      summary: Liste aller Konfigurationen
+      responses:
+        "200":
+          description: OK
+  /config/{name}:
+    get:
+      summary: Datei-Inhalt abrufen
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+        "404": { description: Not Found }
+    post:
+      summary: Datei speichern (mit Backup)
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                content: { type: string }
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200": { description: OK }
+  /backups/{name}:
+    get:
+      summary: Backups auflisten
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+  /backupfile/{name}/{filename}:
+    get:
+      summary: Backup herunterladen
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+        - in: path
+          name: filename
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+  /backupcontent/{name}/{filename}:
+    get:
+      summary: Backup-Inhalt als Text
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+        - in: path
+          name: filename
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+  /restore/{name}/{filename}:
+    post:
+      summary: Backup wiederherstellen
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+        - in: path
+          name: filename
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+  /action/{name}/{cmd}:
+    post:
+      summary: Aktion ausführen (Whitelist per actions)
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+        - in: path
+          name: cmd
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+  /raw/configs:
+    get:
+      summary: configs.json roh lesen
+      responses:
+        "200": { description: OK }
+    post:
+      summary: configs.json roh schreiben (atomar)
+      requestBody:
+        required: true
+        content:
+          application/json: {}
+      responses:
+        "200": { description: OK }
+  /raw/configs/reload:
+    post:
+      summary: configs.json neu laden
+      responses:
+        "200": { description: OK }
+  /raw/configs/{name}:
+    delete:
+      summary: Eintrag aus configs.json löschen (atomar)
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+  /health:
+    get:
+      summary: Health Check
+      responses:
+        "200": { description: OK }
+components: {}
