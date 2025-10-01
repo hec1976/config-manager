@@ -84,10 +84,6 @@ $SYSTEMCTL       = $global->{systemctl}       if defined $global->{systemctl}   
 $SYSTEMCTL_FLAGS = exists $ENV{SYSTEMCTL_FLAGS} ? $ENV{SYSTEMCTL_FLAGS}
                   : (defined $global->{systemctl_flags} ? $global->{systemctl_flags} : '');
 
-# ---- Mojolicious Secrets (optional) ----
-my $sec = $global->{secret};
-my @secrets = ref($sec) eq 'ARRAY' ? @$sec : ($sec // 'change-this-long-random-secret-please');
-app->secrets(\@secrets);
 
 # ---------------- Logging ----------------
 my $logfile = $global->{logfile} // "/var/log/mmbb/config-manager.log";
@@ -98,11 +94,24 @@ my $logconf = qq(
   log4perl.appender.LOG = Log::Log4perl::Appender::File
   log4perl.appender.LOG.filename = $logfile
   log4perl.appender.LOG.mode = append
+  log4perl.appender.LOG.utf8 = 1
   log4perl.appender.LOG.layout = Log::Log4perl::Layout::PatternLayout
   log4perl.appender.LOG.layout.ConversionPattern = %d %-5p %m%n
 );
 Log::Log4perl->init(\$logconf);
 my $logger = Log::Log4perl->get_logger();
+
+
+# ---- Mojolicious Secrets (optional) ----
+my $sec = $global->{secret};
+my @secrets = ref($sec) eq 'ARRAY' ? @$sec : ($sec // 'change-this-long-random-secret-please');
+app->secrets(\@secrets);
+# Warnen, falls das Default-Secret aktiv ist (nur Logging)
+if (grep { defined($_) && $_ eq 'change-this-long-random-secret-please' } @secrets) {
+  $logger->warn('[config-manager] WARNING: default Mojolicious secret in use - please set a long random secret in global.json');
+}
+
+
 
 # ==================================================
 # Security & Verzeichnisse
@@ -393,6 +402,13 @@ app->hook(before_dispatch => sub {
   $c->res->headers->header('Access-Control-Allow-Headers' => 'Content-Type, X-API-Token, Authorization');
   $c->res->headers->header('Access-Control-Max-Age'       => '86400');
   $c->res->headers->header('Vary'                         => 'Origin');
+  $c->res->headers->header('X-Content-Type-Options' => 'nosniff');
+  $c->res->headers->header('X-Frame-Options'        => 'DENY');
+  $c->res->headers->header('Referrer-Policy'        => 'no-referrer');
+  if ($c->req->is_secure) {
+    $c->res->headers->header('Strict-Transport-Security' => 'max-age=31536000; includeSubDomains');
+  }
+  
 
   $logger->info(sprintf('REQ  %s', _fmt_req($c)));
   return $c->render(text => '', status => 204) if $c->req->method eq 'OPTIONS';
@@ -775,7 +791,6 @@ post '/action/*name/*cmd' => sub {
         my $tmp;
         if ($out_r && vec($rin, fileno($out_r), 1)) {
           my $r = sysread($out_r, $tmp, 8192);
-          $buf_out += $tmp if defined $r and $r > 0;
           $buf_out .= $tmp if defined $r && $r > 0;
         }
         if ($err && vec($rin, fileno($err), 1)) {
@@ -880,7 +895,21 @@ post '/action/*name/*cmd' => sub {
     $logger->info("ACTION $svc status=".($active?'running':'stopped'));
     return $c->render(json=>{ok=>1,action=>'status',status=>($active?'running':'stopped')});
   }
-  elsif ($cmd =~ /^(start|stop|reload)$/) {
+  elsif ($cmd eq 'reload') {
+    # Idempotentes Verhalten: Ist die Unit nicht aktiv, ist reload ein NOOP (kein 500)
+    my $active = system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'is-active', $svc) == 0;
+    unless ($active) {
+      $logger->info("ACTION $svc reload noop (inactive)");
+      return $c->render(json=>{
+        ok=>1, action=>'reload', status=>'stopped', note=>'inactive - reload skipped'
+      });
+    }
+    # Unit ist aktiv -> reguläres reload
+    $run->('reload') or return $c->render(json=>{ok=>0,error=>"Reload fehlgeschlagen"}, status=>500);
+    $logger->info("ACTION $svc reload ok=1");
+    return $c->render(json=>{ok=>1,action=>'reload',status=>'ok'});
+  }
+  elsif ($cmd =~ /^(start|stop)$/) {
     $run->($cmd) or return $c->render(json=>{ok=>0,error=>"Aktion $cmd fehlgeschlagen"}, status=>500);
     $logger->info("ACTION $svc $cmd ok=1");
     return $c->render(json=>{ok=>1,action=>$cmd,status=>'ok'});
