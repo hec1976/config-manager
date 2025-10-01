@@ -1,17 +1,109 @@
 [Unit]
-Description=Config Manager REST API
-After=network.target
+Description=Config Agent (hardened)
+Wants=network-online.target
+After=network.target network-online.target
 
 [Service]
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/opt/config-manager
-ExecStart=/opt/config-manager/bin/config-manager.pl daemon -l http://0.0.0.0:8080
+WorkingDirectory=/opt/config-agent
+ExecStart=/usr/bin/perl /opt/config-agent/config-agent.pl
+EnvironmentFile=/opt/env/config-agent.env
+UMask=0027
+
+# ENV/Path härten
+Environment=PATH=/usr/bin:/usr/sbin
+UnsetEnvironment=PERL5LIB PERLLIB PERL5OPT IFS CDPATH ENV BASH_ENV
+# optional:
+UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH
+
+# Restart
+TimeoutStartSec=30
 Restart=on-failure
-Environment=PERL5LIB=/usr/local/lib/perl5
-# Optional: pass API token
-Environment=API_TOKEN=changeme
+RestartSec=3s
+
+# Sandboxing
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+KeyringMode=private
+ProcSubset=pid
+ProtectProc=invisible
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@obsolete
+SystemCallFilter=~@privileged
+
+# Netzwerk
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# nur Loopback?:
+# IPAddressDeny=any
+# IPAddressAllow=127.0.0.1 ::1
+
+# Default-deny Filesystem
+TemporaryFileSystem=/
+
+# Binaries/Libs
+BindReadOnlyPaths=/usr:/usr
+BindReadOnlyPaths=/usr/share:/usr/share
+BindReadOnlyPaths=/lib:/lib
+BindReadOnlyPaths=/lib64:/lib64
+BindReadOnlyPaths=/bin:/bin
+BindReadOnlyPaths=/sbin:/sbin
+
+# /etc-Basics
+BindReadOnlyPaths=/etc/hosts
+BindReadOnlyPaths=/etc/resolv.conf
+BindReadOnlyPaths=/etc/nsswitch.conf
+BindReadOnlyPaths=/etc/localtime
+BindReadOnlyPaths=/etc/machine-id
+
+# Journal NUR wenn benötigt:
+# BindReadOnlyPaths=/run/systemd/journal:/run/systemd/journal
+# SupplementaryGroups=systemd-journal
+
+# HTTPS NUR wenn benötigt:
+# BindReadOnlyPaths=/etc/ssl/ca-bundle.pem
+
+#-----------------------------------
+# Verzeichnis schreiben
+#------------------------------------
+BindPaths=/var/log
+BindPaths=/opt/config-agent
+BindPaths=/etc/postfix
+#BindPaths=/etc/postfix-mailhost
+#BindPaths=/etc/postfix-apphost
+#BindPaths=/etc/postfix-mailhub
+
+#-----------------------------------
+# Verzeichnis lesen
+#-----------------------------------
+# BindReadOnlyPaths=
+
+# Caps minimal (keine nötig)
+AmbientCapabilities=CAP_CHOWN CAP_FOWNER CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+SecureBits=noroot-locked
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mmbb-config-agent
 
 [Install]
 WantedBy=multi-user.target
