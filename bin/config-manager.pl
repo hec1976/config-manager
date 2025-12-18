@@ -842,15 +842,18 @@ post '/action/*name/*cmd' => sub {
       }
     }
 
-    if ($rc == 0) {
-      return $c->render(json=>{
-        ok=>1, action=>'script', runner=>$runner, script=>$script, args=>\@extra, rc=>$rc,
-        stdout=>$out_show, stderr=>$err_show,
-      });
-    } else {
-      return $c->render(status=>500, json=>{ ok=>0, error=>"Script fehlgeschlagen (rc=$rc)", rc=>$rc, stdout=>$out_show, stderr=>$err_show });
-    }
-  }
+  my $ok = ($rc == 0) ? 1 : 0;
+  
+  return $c->render(json=>{
+    ok     => $ok,
+    action => 'script',
+    runner => $runner,
+    script => $script,
+    args   => \@extra,
+    rc     => $rc,
+    stdout => $out_show,
+    stderr => $err_show,
+  });
 
   # Sonderfall: "service":"systemctl" — Subcommand ohne Unit
   if ($svc eq 'systemctl') {
