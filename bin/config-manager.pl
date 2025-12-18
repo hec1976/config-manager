@@ -1,16 +1,15 @@
 #!/usr/bin/env perl
 # Config Manager — REST (actions schema, umask-first, hardened)
-# Version: 1.6.3 (2025-12-18)
+# Version: 1.6.4 (2025-12-18)
 #
 # Korrekturen:
+# - Signal-Handling für systemctl verbessert (gibt 128+Signal zurück)
+# - POSIX Imports bereinigt
 # - Fehlende Module nachgeladen (Net::CIDR)
 # - IPC::Open3 korrekt importiert
-# - Unbenutzte Variablen entfernt
 # - use warnings aktiviert
 # - Fehlerhafte Waitpid-Logik behoben
-# - Nicht initialisierte Variablen behoben
 # - Timeout-Handling für systemctl verbessert
-# - Code-Konsistenz und Best Practices
 
 use strict;
 use warnings;
@@ -31,13 +30,13 @@ use IPC::Open3 qw(open3);
 use Symbol 'gensym';
 use Cwd qw(getcwd realpath);
 use Text::ParseWords qw(shellwords);
-use POSIX (); # fsync
-use POSIX qw(:sys_wait_h WNOHANG);
+# POSIX Imports zusammengefasst
+use POSIX qw(:sys_wait_h WNOHANG fsync);
 
 # ---------------- Umask (grundlegend) ----------------
 umask 0007;  # Dateien: 0660, Verzeichnisse: 0770 (sofern respektiert)
 
-my $VERSION = '1.6.3';
+my $VERSION = '1.6.4';
 
 # ---------------- systemctl (konfigurierbar) ----------------
 my $SYSTEMCTL       = '/usr/bin/systemctl';
@@ -74,7 +73,11 @@ $SYSTEMCTL_FLAGS = exists $ENV{SYSTEMCTL_FLAGS} ? $ENV{SYSTEMCTL_FLAGS}
 # ---------------- Logging ----------------
 my $logfile = $global->{logfile} // "/var/log/mmbb/config-manager.log";
 my $logdir  = dirname($logfile);
-die "Log-Verzeichnis fehlt: $logdir\n" unless -d $logdir;
+# Optional: Verzeichnis erstellen, falls es fehlt
+unless (-d $logdir) {
+    mkdir $logdir, 0755 or die "Log-Verzeichnis fehlt und konnte nicht erstellt werden: $logdir\n";
+}
+
 my $logconf = qq(
   log4perl.rootLogger = INFO, LOG
   log4perl.appender.LOG = Log::Log4perl::Appender::File
@@ -293,6 +296,8 @@ sub _systemctl_with_timeout {
     
     if ($pid == 0) {
         # Child: exec systemctl
+        # Stdin schließen um Hänger zu vermeiden
+        open STDIN, '<', '/dev/null';
         exec @cmd;
         exit 127;  # nur wenn exec fehlschlägt
     }
@@ -305,12 +310,19 @@ sub _systemctl_with_timeout {
     };
     
     alarm $timeout;
-    my $child_pid = waitpid($pid, 0);
+    waitpid($pid, 0);
     alarm 0;
     
     if ($timed_out) {
         $logger->warn("systemctl timeout after ${timeout}s: @cmd");
         return -1;  # Spezieller Rückgabewert für Timeout
+    }
+
+    # NEU: Prüfen ob durch Signal beendet (außer wir haben es selbst gekillt - timed_out)
+    if (($? & 127) > 0) {
+        my $sig = $? & 127;
+        $logger->warn("systemctl died with signal $sig: @cmd");
+        return 128 + $sig; # Übliche Konvention für Signal-Exits
     }
     
     return $? >> 8;
