@@ -17,7 +17,7 @@
 # - Actions: exec:systemctl is-active normalisiert ohne zweiten system()-Call; konsistentes JSON.
 # - Style: Tabs→Spaces im is-active-Block; keine Funktionsänderung.
 #
-# Aenderungen gegenueber 1.6.1
+# Aenderungen ggü. 1.6.1
 # - Script Runner: Bei rc != 0 kein HTTP 500 mehr, sondern HTTP 200 mit ok Flag sowie rc/stdout/stderr im JSON (Warnungen von postmulti brechen die API nicht mehr ab).
 # - Timeouts bleiben unveraendert als HTTP 504 (echte Haenger werden weiter klar signalisiert).
 # - Ziel: Stabilere Automatisierung bei Postfix, Warnungen bleiben sichtbar, aber ohne Hard Fail.
