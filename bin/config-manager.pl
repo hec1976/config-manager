@@ -854,18 +854,20 @@ post '/action/*name/*cmd' => sub {
       }
     }
 
-  my $ok = ($rc == 0) ? 1 : 0;
-  
-  return $c->render(json=>{
-    ok     => $ok,
-    action => 'script',
-    runner => $runner,
-    script => $script,
-    args   => \@extra,
-    rc     => $rc,
-    stdout => $out_show,
-    stderr => $err_show,
-  });
+    my $ok = ($rc == 0) ? 1 : 0;
+
+    return $c->render(json=>{
+      ok     => $ok,
+      action => 'script',
+      runner => $runner,
+      script => $script,
+      args   => \@extra,
+      rc     => $rc,
+      stdout => $out_show,
+      stderr => $err_show,
+    });
+
+  } 
 
   # Sonderfall: "service":"systemctl" — Subcommand ohne Unit
   if ($svc eq 'systemctl') {
