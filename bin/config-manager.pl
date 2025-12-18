@@ -2,11 +2,6 @@
 # Config Manager — REST (actions schema, umask-first, hardened)
 # Version: 1.6.2 (2025-12-18)
 #
-# Aenderungen gegenueber 1.6.1
-# Script Runner: Bei rc != 0 kein HTTP 500 mehr, sondern HTTP 200 mit ok Flag sowie rc/stdout/stderr im JSON (Warnungen von postmulti brechen die API nicht mehr ab).
-# Timeouts bleiben unveraendert als HTTP 504 (echte Haenger werden weiter klar signalisiert).
-# Ziel: Stabilere Automatisierung bei Postfix, Warnungen bleiben sichtbar, aber ohne Hard Fail.
-#
 # Änderungen ggü. 1.5.0:
 # - allowed_roots optional gemacht via path_guard: off|audit|enforce (Default: off)
 # - Symlinks weiterhin verboten (Defense-in-Depth)
@@ -21,6 +16,11 @@
 # - configs.json: atomare Writes in POST /raw/configs und DELETE /raw/configs/:name (write_atomic).
 # - Actions: exec:systemctl is-active normalisiert ohne zweiten system()-Call; konsistentes JSON.
 # - Style: Tabs→Spaces im is-active-Block; keine Funktionsänderung.
+#
+# Aenderungen gegenueber 1.6.1
+# - Script Runner: Bei rc != 0 kein HTTP 500 mehr, sondern HTTP 200 mit ok Flag sowie rc/stdout/stderr im JSON (Warnungen von postmulti brechen die API nicht mehr ab).
+# - Timeouts bleiben unveraendert als HTTP 504 (echte Haenger werden weiter klar signalisiert).
+# - Ziel: Stabilere Automatisierung bei Postfix, Warnungen bleiben sichtbar, aber ohne Hard Fail.
 #
 # Kurzbeschreibung:
 # - Liest/schreibt generische Konfigurationsdateien (atomar, UTF-8/raw)
