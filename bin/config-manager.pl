@@ -835,7 +835,14 @@ post '/action/*name/*cmd' => sub {
     my $out_show = length($buf_out) > $MAX ? (substr($buf_out,0,$MAX)."...[truncated]") : $buf_out;
     my $err_show = length($buf_err) > $MAX ? (substr($buf_err,0,$MAX)."...[truncated]") : $buf_err;
 
-    $logger->info(sprintf('SCRIPT done %s rc=%d time=%.3fs bytes_out=%d bytes_err=%d', _fmt_req($c), $rc, $dur, length($buf_out), length($buf_err)));
+    $logger->info(sprintf(
+      'SCRIPT done %s rc=%d time=%.3fs bytes_out=%d bytes_err=%d',
+      _fmt_req($c),
+      $rc,
+      $dur,
+      length($buf_out),
+      length($buf_err)
+    ));
 
     # Optional: Status normalisieren für exec:systemctl is-active (kein zweiter system()-Call)
     if ($is_systemctl_exec) {
