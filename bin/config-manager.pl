@@ -812,20 +812,32 @@ post '/action/*name/*cmd' => sub {
       close $out_r if $out_r;
       close $err   if $err;
       1;
-    } or do {
-      my $err_msg = $@ // 'unknown';
-      kill 9, $pid if $pid;
-      waitpid($pid, 0) if $pid;
-      chdir $cwd_prev if defined $cwd_prev;
-      my $dur = time() - $start;
-      if ($err_msg =~ /timeout/) {
-        $logger->warn(sprintf('SCRIPT timeout %s runner=%s script=%s after=%.3fs', _fmt_req($c), $runner, $script, $dur));
-        return $c->render(json=>{ok=>0,error=>"Script timeout nach ${timeout}s"}, status=>504);
-      } else {
-        $logger->warn(sprintf('SCRIPT failed %s runner=%s script=%s after=%.3fs err=%s', _fmt_req($c), $runner, $script, $dur, $err_msg));
-        return $c->render(json=>{ok=>0,error=>"Script-Ausführung fehlgeschlagen: $err_msg"}, status=>500);
-      }
-    };
+      } or do {
+        alarm 0;  # Fix 2: Alarm im Fehlerpfad immer stoppen
+      
+        my $err_msg = $@ // 'unknown';
+      
+        kill 9, $pid if $pid;
+        waitpid($pid, 0) if $pid;
+      
+        chdir $cwd_prev if defined $cwd_prev;
+      
+        my $dur = time() - $start;
+      
+        if ($err_msg =~ /timeout/) {
+          $logger->warn(sprintf(
+            'SCRIPT timeout %s runner=%s script=%s after=%.3fs',
+            _fmt_req($c), $runner, $script, $dur
+          ));
+          return $c->render(json=>{ ok=>0, error=>"Script timeout nach ${timeout}s" }, status=>504);
+        } else {
+          $logger->warn(sprintf(
+            'SCRIPT failed %s runner=%s script=%s after=%.3fs err=%s',
+            _fmt_req($c), $runner, $script, $dur, $err_msg
+          ));
+          return $c->render(json=>{ ok=>0, error=>"Script-Ausführung fehlgeschlagen: $err_msg" }, status=>500);
+        }
+      };
 
     chdir $cwd_prev if defined $cwd_prev;
 
