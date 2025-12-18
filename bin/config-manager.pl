@@ -52,6 +52,7 @@ use Symbol 'gensym';
 use Cwd qw(getcwd realpath);
 use Text::ParseWords qw(shellwords);
 use POSIX (); # fsync
+use POSIX qw(:sys_wait_h);
 
 # ---------------- Umask (grundlegend) ----------------
 umask 0007;  # Dateien: 0660, Verzeichnisse: 0770 (sofern respektiert)
@@ -787,24 +788,57 @@ post '/action/*name/*cmd' => sub {
       alarm $timeout;
 
       while (1) {
-        my $rin = '';
-        vec($rin, fileno($out_r), 1) = 1 if $out_r && defined fileno($out_r);
-        vec($rin, fileno($err),  1) = 1 if $err   && defined fileno($err);
-        my $n = select($rin, undef, undef, 1);
-        last if $n <= 0;
+        # Child Status (nicht blockierend)
+        my $wp = waitpid($pid, WNOHANG);
+        my $child_done = ($wp == $pid) ? 1 : 0;
 
-        my $tmp;
-        if ($out_r && vec($rin, fileno($out_r), 1)) {
+        my $rin = '';
+
+        my $out_open = ($out_r && defined fileno($out_r)) ? 1 : 0;
+        my $err_open = ($err   && defined fileno($err))   ? 1 : 0;
+
+        vec($rin, fileno($out_r), 1) = 1 if $out_open;
+        vec($rin, fileno($err),  1) = 1 if $err_open;
+
+        # Wenn beide Pipes zu sind, koennen wir raus, sobald der Child fertig ist
+        last if ($child_done && !$out_open && !$err_open);
+
+        # Falls grad kein FD mehr offen ist, aber Child noch laeuft, kurz warten und weiter
+        if ($rin eq '') {
+          select(undef, undef, undef, 0.05);
+          next;
+        }
+
+        my $n = select(my $rout = $rin, undef, undef, 1);
+
+        die "select failed: $!" if !defined $n;
+
+        # Timeout (kein FD war lesbar) ist normal, nicht abbrechen
+        next if $n == 0;
+
+        my $tmp = '';
+
+        # stdout lesen
+        if ($out_open && vec($rout, fileno($out_r), 1)) {
           my $r = sysread($out_r, $tmp, 8192);
-          $buf_out .= $tmp if defined $r && $r > 0;
+          die "sysread stdout failed: $!" if !defined $r;
+          if ($r == 0) {
+            close($out_r);
+          } else {
+            $buf_out .= $tmp;
+          }
         }
-        if ($err && vec($rin, fileno($err), 1)) {
+
+        # stderr lesen
+        if ($err_open && vec($rout, fileno($err), 1)) {
           my $r = sysread($err, $tmp, 8192);
-          $buf_err .= $tmp if defined $r && $r > 0;
+          die "sysread stderr failed: $!" if !defined $r;
+          if ($r == 0) {
+            close($err);
+          } else {
+            $buf_err .= $tmp;
+          }
         }
-        my $eof_out = ($out_r && defined fileno($out_r)) ? eof($out_r) : 1;
-        my $eof_err = ($err   && defined fileno($err))   ? eof($err)   : 1;
-        last if $eof_out && $eof_err;
       }
 
       waitpid($pid, 0);
