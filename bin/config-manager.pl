@@ -1,12 +1,13 @@
 #!/usr/bin/env perl
 # Config Manager — REST (actions schema, umask-first, hardened)
-# Version: 1.6.5 (2025-12-18)
+# Version: 1.6.6 (2025-12-18)
 #
-# Changelog 1.6.5:
-# - FIX: POSIX::fsync Import-Fehler behoben (Skript startete nicht)
-# - FIX: Signal-Handling für systemctl (Segfault-Erkennung)
-# - OPT: Waitpid Loop optimiert
-# - OPT: Automatisches Erstellen des Log-Verzeichnisses
+# Changelog 1.6.6:
+# - ROLLBACK: Backup/Restore-Logik exakt wie in v1.6.1 (für GUI-Kompatibilität)
+# - FIX: Endpoint /backupcontent wiederhergestellt
+# - FIX: JSON-Response bei Restore wieder ausführlich (requested/applied Meta)
+# - KEEP: POSIX::fsync Fix aus v1.6.5
+# - KEEP: Systemctl Signal-Handling & Waitpid-Optimierung aus v1.6.5
 
 use strict;
 use warnings;
@@ -27,13 +28,13 @@ use IPC::Open3 qw(open3);
 use Symbol 'gensym';
 use Cwd qw(getcwd realpath);
 use Text::ParseWords qw(shellwords);
-# FIX: fsync aus Import entfernt, um "is not exported" Fehler zu vermeiden
+# FIX v1.6.5: fsync aus Import entfernt
 use POSIX qw(:sys_wait_h WNOHANG); 
 
 # ---------------- Umask (grundlegend) ----------------
-umask 0007;  # Dateien: 0660, Verzeichnisse: 0770 (sofern respektiert)
+umask 0007;
 
-my $VERSION = '1.6.5';
+my $VERSION = '1.6.6';
 
 # ---------------- systemctl (konfigurierbar) ----------------
 my $SYSTEMCTL       = '/usr/bin/systemctl';
@@ -45,7 +46,6 @@ my $SYSTEMCTL_FLAGS = '';
 my $globalfile  = "$Bin/global.json";
 my $configsfile = "$Bin/configs.json";
 
-# Sanity Check vor dem Start
 unless (-f $globalfile) { die "FEHLER: global.json fehlt in $Bin\n"; }
 unless (-f $configsfile) { die "FEHLER: configs.json fehlt in $Bin\n"; }
 
@@ -63,7 +63,6 @@ die "global.json ungültig: $@" if $@ || ref($global) ne 'HASH';
 my $configs = eval { decode_json(read_all($configsfile)) };
 die "configs.json ungültig: $@" if $@ || ref($configs) ne 'HASH';
 
-# systemctl aus Config/ENV übernehmen
 $SYSTEMCTL       = $global->{systemctl}       if defined $global->{systemctl}       && $global->{systemctl} ne '';
 $SYSTEMCTL_FLAGS = exists $ENV{SYSTEMCTL_FLAGS} ? $ENV{SYSTEMCTL_FLAGS}
                   : (defined $global->{systemctl_flags} ? $global->{systemctl_flags} : '');
@@ -73,7 +72,7 @@ $SYSTEMCTL_FLAGS = exists $ENV{SYSTEMCTL_FLAGS} ? $ENV{SYSTEMCTL_FLAGS}
 my $logfile = $global->{logfile} // "/var/log/mmbb/config-manager.log";
 my $logdir  = dirname($logfile);
 
-# FIX: Log-Verzeichnis erstellen, falls es fehlt (verhindert Crash beim Start)
+# FIX v1.6.5: Auto-Create Logdir
 unless (-d $logdir) {
     eval { mkdir $logdir, 0755; 1 };
     if ($@ || !-d $logdir) {
@@ -90,7 +89,6 @@ my $logconf = qq(
   log4perl.appender.LOG.layout = Log::Log4perl::Layout::PatternLayout
   log4perl.appender.LOG.layout.ConversionPattern = %d %-5p %m%n
 );
-# Fallback auf Screen-Logger falls Datei nicht schreibbar
 if (!-d $logdir || !-w $logdir) {
     $logconf = qq(
       log4perl.rootLogger = INFO, SCREEN
@@ -99,7 +97,6 @@ if (!-d $logdir || !-w $logdir) {
       log4perl.appender.SCREEN.layout.ConversionPattern = %d %-5p %m%n
     );
 }
-
 Log::Log4perl->init(\$logconf);
 my $logger = Log::Log4perl->get_logger();
 
@@ -124,16 +121,12 @@ $allowed_ips = [] unless ref($allowed_ips) eq 'ARRAY';
 my $tmpDir     = $global->{tmpDir}     // "$Bin/tmp";
 my $backupRoot = $global->{backupDir}  // "$Bin/backup";
 
-# Verzeichnisse sicherstellen
 unless (-d $backupRoot) { mkdir $backupRoot, 0750 or die "Backup-Dir $backupRoot fehlt/nicht erstellbar"; }
 unless (-d $tmpDir)     { mkdir $tmpDir, 0750     or die "Tmp-Dir $tmpDir fehlt/nicht erstellbar"; }
 
 my $maxBackups = $global->{maxBackups} // 10;
-
-# -------- Pfad-Guard --------
 my $path_guard = lc($ENV{PATH_GUARD} // ($global->{path_guard} // 'off'));
 
-# allowed_roots: beim Boot kanonisieren
 my @ALLOWED_CANON = ();
 if (ref($global->{allowed_roots}) eq 'ARRAY') {
   my %seen;
@@ -144,14 +137,9 @@ if (ref($global->{allowed_roots}) eq 'ARRAY') {
     }
   }
 }
+if (@ALLOWED_CANON) { $logger->info('ALLOWED_ROOTS='.join(',', @ALLOWED_CANON)); } 
+else { $logger->info('ALLOWED_ROOTS=(leer)'); }
 
-if (@ALLOWED_CANON) {
-  $logger->info('ALLOWED_ROOTS='.join(',', @ALLOWED_CANON));
-} else {
-  $logger->info('ALLOWED_ROOTS=(leer)');
-}
-
-# Optionales Verhalten
 my $apply_meta_enabled         = $global->{apply_meta}           // 0;
 my $auto_create_backup_subdirs = $global->{auto_create_backups}  // 0;
 my $fsync_dir_enabled          = $global->{fsync_dir}            // 0;
@@ -200,7 +188,7 @@ sub _fsync_dir {
   my ($path) = @_;
   my $dir = dirname($path);
   sysopen(my $dh, $dir, O_RDONLY) or return;
-  # FIX: POSIX::fsync voll qualifiziert aufrufen
+  # FIX v1.6.5: POSIX::fsync voll qualifiziert
   eval { POSIX::fsync(fileno($dh)); };
   close $dh;
 }
@@ -230,17 +218,8 @@ sub _is_allowed_path {
 }
 
 
-sub _name2uid { 
-    my ($n)=@_; 
-    return undef unless defined $n && length $n; 
-    return $n =~ /^\d+$/ ? 0+$n : scalar((getpwnam($n))[2]); 
-}
-
-sub _name2gid { 
-    my ($n)=@_; 
-    return undef unless defined $n && length $n; 
-    return $n =~ /^\d+$/ ? 0+$n : scalar((getgrnam($n))[2]); 
-}
+sub _name2uid { my ($n)=@_; return undef unless defined $n && length $n; return $n =~ /^\d+$/ ? 0+$n : scalar((getpwnam($n))[2]); }
+sub _name2gid { my ($n)=@_; return undef unless defined $n && length $n; return $n =~ /^\d+$/ ? 0+$n : scalar((getgrnam($n))[2]); }
 
 sub _apply_meta {
   my ($e,$path) = @_;
@@ -311,7 +290,7 @@ sub _systemctl_with_timeout {
         return -1;
     }
 
-    # FIX: Prüfen ob durch Signal beendet (128 + Sig)
+    # FIX v1.6.5: Signal-Erkennung
     if (($? & 127) > 0) {
         my $sig = $? & 127;
         $logger->warn("systemctl died with signal $sig: @cmd");
@@ -355,7 +334,6 @@ sub _rebuild_cfgmap_from {
   %cfgmap = ();
   while (my ($name,$entry) = each %{$cfg}) {
     next if !defined $name || $name =~ m{[/\\]} || $name =~ m{\.\.};
-
     my $actions = _derive_actions($entry);
     $cfgmap{$name} = {
       %$entry,
@@ -392,9 +370,7 @@ sub _fmt_req {
   return sprintf('req_id=%s ip=%s %s %s', $m->{req_id}, $m->{ip}, $m->{method}, $m->{path});
 }
 
-my %TRUSTED = map { $_ => 1 } (
-  ref($global->{trusted_proxies}) eq 'ARRAY' ? @{$global->{trusted_proxies}} : ()
-);
+my %TRUSTED = map { $_ => 1 } (ref($global->{trusted_proxies}) eq 'ARRAY' ? @{$global->{trusted_proxies}} : ());
 
 sub _client_ip {
   my ($c) = @_;
@@ -409,13 +385,10 @@ sub _client_ip {
   return $rip;
 }
 
-my %ALLOW_ORIGIN = map { $_ => 1 } (
-  ref($global->{allow_origins}) eq 'ARRAY' ? @{$global->{allow_origins}} : ()
-);
+my %ALLOW_ORIGIN = map { $_ => 1 } (ref($global->{allow_origins}) eq 'ARRAY' ? @{$global->{allow_origins}} : ());
 
 app->hook(before_dispatch => sub {
   my $c = shift;
-
   $c->stash(req_id => sprintf('%x-%x', int(time()*1000), $$));
   $c->stash(t0     => time());
   $c->stash(client_ip => _client_ip($c));
@@ -565,19 +538,34 @@ post '/config/*name' => sub {
   my $method;
   eval { $method = safe_write_file($path, $content); 1 } or return $c->render(json=>{ok=>0,error=>"Schreibfehler: $@"}, status=>500);
 
-  # Meta
+  # Meta - RESTORED LOGIC from 1.6.1 for detailed response
+  my $meta_wanted = defined $e->{apply_meta} ? $e->{apply_meta}
+                  : ($apply_meta_enabled || defined($e->{user}) || defined($e->{group}) || defined($e->{mode}));
+  
   eval { _apply_meta($e, $path); 1 } or $logger->warn("apply_meta Fehler: $@");
+  
+  my $applied_mode = _mode_str($path);
+  my ($uid,$gid)   = ((stat($path))[4], (stat($path))[5]);
 
-  $c->render(json => { ok=>1, saved => $name, method => $method });
+  $c->render(json => { 
+    ok=>1, 
+    saved => $name, 
+    path => $path, 
+    method => $method,
+    requested => { user=>$e->{user}, group=>$e->{group}, mode=>$e->{mode}, apply_meta => ($meta_wanted ? JSON::MaybeXS::true : JSON::MaybeXS::false) },
+    applied   => { uid=>$uid, gid=>$gid, mode=>$applied_mode }
+  });
 };
+
+# --- BACKUP LOGIC RESTORED FROM 1.6.1 ---
 
 get '/backups/*name' => sub {
   my $c = shift;
   my $name = $c->stash('name');
-  return $c->render(json=>{ok=>0,error=>'Invalid'}, status=>400) if $name =~ m{[/\\]};
-  my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannt"}, status=>404);
+  return $c->render(json=>{ok=>0,error=>'Ungültiger Name'}, status=>400) if $name =~ m{[/\\]} || $name =~ m{\.\.};
+  my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannte Konfiguration: $name"}, status=>404);
   my $bdir = $e->{backup_dir};
-  return $c->render(json=>{ok=>0,error=>"Backup-Dir fehlt"}, status=>500) unless -d $bdir;
+  return $c->render(json=>{ok=>0,error=>"Backup-Verzeichnis fehlt: $bdir"}, status=>500) unless -d $bdir;
   my $base = basename($e->{path});
   my @files = sort { $b cmp $a } grep { defined } glob("$bdir/$base.bak.*");
   @files = map { s{^\Q$bdir\E/}{}r } @files;
@@ -586,30 +574,78 @@ get '/backups/*name' => sub {
 
 get '/backupfile/*name/*filename' => sub {
   my $c = shift;
-  my ($name,$fn) = ($c->stash('name'), $c->stash('filename'));
-  return $c->render(json=>{ok=>0,error=>'Invalid'}, status=>400) if $name =~ m{[/\\]} || $fn =~ m{[/\\]};
-  my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannt"}, status=>404);
-  my $file = "$e->{backup_dir}/$fn";
-  return $c->render(json=>{ok=>0,error=>'Backup fehlt'}, status=>404) unless -f $file;
+  my $name = $c->stash('name');
+  my $filename = $c->stash('filename');
+  return $c->render(json=>{ok=>0,error=>'Ungültiger Name/Filename'}, status=>400)
+    if $name =~ m{[/\\]} || $name =~ m{\.\.} || $filename =~ m{[/\\]} || $filename =~ m{\.\.};
+  my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannte Konfiguration: $name"}, status=>404);
+  my $bdir = $e->{backup_dir};
+  my $base = basename($e->{path});
+  return $c->render(json=>{ok=>0,error=>'Ungültiger Backup-Name'}, status=>400)
+    unless $filename =~ /^\Q$base\E\.bak\.\d{8}_\d{6}$/;
+
+  my $file = "$bdir/$filename";
+  return $c->render(json=>{ok=>0,error=>'Backup nicht gefunden'}, status=>404) unless -f $file;
   $c->res->headers->content_type('application/octet-stream');
-  $c->res->headers->content_disposition("attachment; filename=\"$fn\"");
-  $c->reply->file($file);
+  $c->res->headers->content_disposition("attachment; filename=\"$filename\"");
+  return $c->reply->file($file);
+};
+
+# Endpoint /backupcontent was missing in 1.6.5 - RESTORED
+get '/backupcontent/*name/*filename' => sub {
+  my $c = shift;
+  my $name = $c->stash('name');
+  my $filename = $c->stash('filename');
+  return $c->render(json=>{ok=>0,error=>'Ungültiger Name/Filename'}, status=>400)
+    if $name =~ m{[/\\]} || $name =~ m{\.\.} || $filename =~ m{[/\\]} || $filename =~ m{\.\.};
+  my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannte Konfiguration: $name"}, status=>404);
+  my $bdir = $e->{backup_dir};
+  my $base = basename($e->{path});
+  return $c->render(json=>{ok=>0,error=>'Ungültiger Backup-Name'}, status=>400)
+    unless $filename =~ /^\Q$base\E\.bak\.\d{8}_\d{6}$/;
+
+  my $file = "$bdir/$filename";
+  return $c->render(json=>{ok=>0,error=>'Backup nicht gefunden'}, status=>404) unless -f $file;
+  open my $fh, '<:raw', $file or return $c->render(json=>{ok=>0,error=>"Die Backup-Datei konnte nicht geöffnet werden: $!"}, status=>500);
+  my $content = do { local $/; <$fh> }; close $fh;
+  $c->render(json => { ok=>1, content => $content });
 };
 
 post '/restore/*name/*filename' => sub {
   my $c = shift;
-  my ($name,$fn) = ($c->stash('name'), $c->stash('filename'));
-  return $c->render(json=>{ok=>0,error=>'Invalid'}, status=>400) if $name =~ m{[/\\]} || $fn =~ m{[/\\]};
-  my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannt"}, status=>404);
-  my $src = "$e->{backup_dir}/$fn";
+  my $name = $c->stash('name');
+  my $filename = $c->stash('filename');
+  return $c->render(json=>{ok=>0,error=>'Ungültiger Name/Filename'}, status=>400)
+    if $name =~ m{[/\\]} || $name =~ m{\.\.} || $filename =~ m{[/\\]} || $filename =~ m{\.\.};
+  my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannte Konfiguration: $name"}, status=>404);
+  my $base = basename($e->{path});
+  my $bdir = $e->{backup_dir};
+  return $c->render(json=>{ok=>0,error=>'Ungültiger Backup-Name'}, status=>400)
+    unless $filename =~ /^\Q$base\E\.bak\.\d{8}_\d{6}$/;
+
+  my $src  = "$bdir/$filename";
   my $dest = $e->{path};
-  return $c->render(json=>{ok=>0,error=>'Backup fehlt'}, status=>404) unless -f $src;
+  return $c->render(json=>{ok=>0,error=>'Backup nicht gefunden'}, status=>404) unless -f $src;
   return $c->render(json=>{ok=>0,error=>'Pfad nicht erlaubt'}, status=>400) unless _is_allowed_path($dest);
   
-  copy($src, $dest) or return $c->render(json=>{ok=>0,error=>"Restore fehlgeschlagen: $!"}, status=>500);
+  copy($src, $dest) or return $c->render(json=>{ok=>0,error=>"Wiederherstellung fehlgeschlagen: $!"}, status=>500);
   eval { _apply_meta($e, $dest); 1 } or $logger->warn("apply_meta Fehler: $@");
-  $c->render(json => { ok=>1, restored => $name });
+  
+  my $applied_mode = _mode_str($dest);
+  my ($uid,$gid)   = ((stat($dest))[4], (stat($dest))[5]);
+  my $meta_wanted = defined $e->{apply_meta} ? $e->{apply_meta}
+                  : ($apply_meta_enabled || defined($e->{user}) || defined($e->{group}) || defined($e->{mode}));
+
+  # FULL JSON Response like 1.6.1 for GUI compatibility
+  $c->render(json => {
+    ok=>1,
+    restored  => $name, from => $filename,
+    requested => { user=>$e->{user}, group=>$e->{group}, mode=>$e->{mode}, apply_meta => ($meta_wanted ? JSON::MaybeXS::true : JSON::MaybeXS::false) },
+    applied   => { uid=>$uid, gid=>$gid, mode=>$applied_mode }
+  });
 };
+
+# -----------------------------------------------
 
 post '/action/*name/*cmd' => sub {
   my $c = shift;
@@ -638,7 +674,6 @@ post '/action/*name/*cmd' => sub {
     my ($runner, $script) = ($1, $2);
     return $c->render(json=>{ok=>0,error=>"Script fehlt: $script"}, status=>404) unless -f $script;
     
-    # exec systemctl guardrails
     if ($runner eq 'exec' && $script =~ m{/systemctl$}) {
         return $c->render(json=>{ok=>0,error=>'Subcommand verboten'}, status=>400) if ($extra[0]//'') =~ /^(poweroff|reboot|halt)$/;
     }
@@ -692,7 +727,6 @@ post '/action/*name/*cmd' => sub {
     chdir $cwd_prev;
     my $rc = $? >> 8;
     
-    # exec systemctl output parsing
     if ($runner eq 'exec' && $script =~ m{/systemctl$} && ($extra[0]//'') eq 'is-active') {
        return $c->render(json=>{ok=>1, status=>($rc==0?'running':'stopped'), rc=>$rc});
     }
@@ -703,14 +737,12 @@ post '/action/*name/*cmd' => sub {
     });
   }
 
-  # Systemctl Subcommand
   if ($svc eq 'systemctl') {
       return $c->render(json=>{ok=>0,error=>'Forbidden'}, status=>400) if $cmd =~ /^(poweroff|reboot|halt)$/;
       my $rc = system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd);
       return $rc == 0 ? $c->render(json=>{ok=>1}) : $c->render(json=>{ok=>0,error=>"rc=$rc"}, status=>500);
   }
 
-  # Real Service
   my $run = sub { return _systemctl_with_timeout(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $_[0], $svc) == 0; };
   
   if ($cmd eq 'status' || $cmd eq 'stop_start' || $cmd eq 'restart' || $cmd eq 'reload') {
@@ -732,7 +764,6 @@ post '/action/*name/*cmd' => sub {
   }
 };
 
-# Raw Configs
 get '/raw/configs' => sub { shift->render(data => read_all($configsfile)); };
 
 post '/raw/configs' => sub {
