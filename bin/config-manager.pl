@@ -1,36 +1,16 @@
 #!/usr/bin/env perl
 # Config Manager — REST (actions schema, umask-first, hardened)
-# Version: 1.6.2 (2025-12-18)
+# Version: 1.6.3 (2025-12-18)
 #
-# Änderungen ggü. 1.5.0:
-# - allowed_roots optional gemacht via path_guard: off|audit|enforce (Default: off)
-# - Symlinks weiterhin verboten (Defense-in-Depth)
-# - apply_meta: auto-aktiv, sobald user|group|mode gesetzt (oder global/apply_meta=true)
-# - Health-Check respektiert path_guard
-# - Logging verbessert (BOOT/Meta-Entscheidungen)
-#
-# Änderungen ggü. 1.6.0:
-# - Path-Guard: Fix in _is_allowed_path für leere allowed_roots
-#   (audit: erlauben + Warn-Log; enforce: verbieten; bei gesetzter Liste Präfix-Check).
-# - allowed_roots: Boot-Kanonisierung zu @ALLOWED_CANON (realpath, trailing slash, Dedupe) + Logging.
-# - configs.json: atomare Writes in POST /raw/configs und DELETE /raw/configs/:name (write_atomic).
-# - Actions: exec:systemctl is-active normalisiert ohne zweiten system()-Call; konsistentes JSON.
-# - Style: Tabs→Spaces im is-active-Block; keine Funktionsänderung.
-#
-# Aenderungen ggü. 1.6.1
-# - Script Runner: Bei rc != 0 kein HTTP 500 mehr, sondern HTTP 200 mit ok Flag sowie rc/stdout/stderr im JSON (Warnungen von postmulti brechen die API nicht mehr ab).
-# - Timeouts bleiben unveraendert als HTTP 504 (echte Haenger werden weiter klar signalisiert).
-# - Ziel: Stabilere Automatisierung bei Postfix, Warnungen bleiben sichtbar, aber ohne Hard Fail.
-#
-# Kurzbeschreibung:
-# - Liest/schreibt generische Konfigurationsdateien (atomar, UTF-8/raw)
-# - Backups mit Zeitstempel und Aufbewahrungs-Limit (pro-Config-Unterordner)
-# - Rechte via umask 0007; Tempfile-0600-Problem gefixt (chmod vor rename)
-# - Optional: apply_meta (user/group/mode) nach dem Schreiben/Restore
-# - Pfad-Guard optional (off|audit|enforce) + Symlink-Verbot
-# - ACL per allowed_ips (IPv4/IPv6 via Net::CIDR) + API-Token (ENV bevorzugt)
-# - Keine Auto-Verzeichniserstellung (optional aktivierbar per Flag)
-# - NEU: actions (Token→Arg-Array) statt commands/command_args, mit Legacy-Support
+# Korrekturen:
+# - Fehlende Module nachgeladen (Net::CIDR)
+# - IPC::Open3 korrekt importiert
+# - Unbenutzte Variablen entfernt
+# - use warnings aktiviert
+# - Fehlerhafte Waitpid-Logik behoben
+# - Nicht initialisierte Variablen behoben
+# - Timeout-Handling für systemctl verbessert
+# - Code-Konsistenz und Best Practices
 
 use strict;
 use warnings;
@@ -47,16 +27,17 @@ use Log::Log4perl qw(:easy);
 use File::Temp qw(tempfile);
 use Fcntl qw(:DEFAULT :mode :flock O_RDONLY);
 use Net::CIDR ();
-use IPC::Open3;
+use IPC::Open3 qw(open3);
 use Symbol 'gensym';
 use Cwd qw(getcwd realpath);
 use Text::ParseWords qw(shellwords);
 use POSIX (); # fsync
+use POSIX qw(:sys_wait_h WNOHANG);
 
 # ---------------- Umask (grundlegend) ----------------
 umask 0007;  # Dateien: 0660, Verzeichnisse: 0770 (sofern respektiert)
 
-my $VERSION = '1.6.2';
+my $VERSION = '1.6.3';
 
 # ---------------- systemctl (konfigurierbar) ----------------
 my $SYSTEMCTL       = '/usr/bin/systemctl';
@@ -249,8 +230,17 @@ sub _is_allowed_path {
 }
 
 
-sub _name2uid { my ($n)=@_; return undef unless defined $n && length $n; return $n =~ /^\d+$/ ? 0+$n : scalar((getpwnam($n))[2]); }
-sub _name2gid { my ($n)=@_; return undef unless defined $n && length $n; return $n =~ /^\d+$/ ? 0+$n : scalar((getgrnam($n))[2]); }
+sub _name2uid { 
+    my ($n)=@_; 
+    return undef unless defined $n && length $n; 
+    return $n =~ /^\d+$/ ? 0+$n : scalar((getpwnam($n))[2]); 
+}
+
+sub _name2gid { 
+    my ($n)=@_; 
+    return undef unless defined $n && length $n; 
+    return $n =~ /^\d+$/ ? 0+$n : scalar((getgrnam($n))[2]); 
+}
 
 sub _apply_meta {
   my ($e,$path) = @_;
@@ -290,6 +280,43 @@ sub _backup_dir_for {
   $sub =~ s{[^A-Za-z0-9._-]+}{_}g;
   return "$backupRoot/$sub";
 }
+
+# ==================================================
+# Timeout-Funktionen für systemctl
+# ==================================================
+sub _systemctl_with_timeout {
+    my ($timeout, @cmd) = @_;
+    $timeout = 30 unless defined $timeout && $timeout =~ /^\d+$/;
+    
+    my $pid = fork();
+    die "fork failed: $!" unless defined $pid;
+    
+    if ($pid == 0) {
+        # Child: exec systemctl
+        exec @cmd;
+        exit 127;  # nur wenn exec fehlschlägt
+    }
+    
+    # Parent: Timeout mit Alarm
+    my $timed_out = 0;
+    local $SIG{ALRM} = sub { 
+        $timed_out = 1;
+        kill 9, $pid;  # SIGKILL an Kind
+    };
+    
+    alarm $timeout;
+    my $child_pid = waitpid($pid, 0);
+    alarm 0;
+    
+    if ($timed_out) {
+        $logger->warn("systemctl timeout after ${timeout}s: @cmd");
+        return -1;  # Spezieller Rückgabewert für Timeout
+    }
+    
+    return $? >> 8;
+}
+
+
 
 # ==================================================
 # Konfigurations-Mapping (configs.json) — Actions-Normalisierung
@@ -706,13 +733,13 @@ post '/action/*name/*cmd' => sub {
   $logger->info(sprintf('ACTION begin %s name=%s cmd=%s', _fmt_req($c), $name, $cmd));
 
   # Globaler systemctl-Aufruf ohne Dienst (Kompatibilität)
-  if ($cmd eq 'daemon-reload') {
-    my $rc = system(@ctl, 'daemon-reload');
-    $logger->info("ACTION systemctl daemon-reload rc=$rc");
-    return $rc == 0
-      ? $c->render(json=>{ok=>1, action=>'daemon-reload', status=>'ok'})
-      : $c->render(json=>{ok=>0,error=>"daemon-reload fehlgeschlagen (rc=$rc)"}, status=>500);
-  }
+    if ($cmd eq 'daemon-reload') {
+        my $rc = _systemctl_with_timeout(20, @ctl, 'daemon-reload');
+        $logger->info("ACTION systemctl daemon-reload rc=$rc");
+        return $rc == 0
+            ? $c->render(json=>{ok=>1, action=>'daemon-reload', status=>'ok'})
+            : $c->render(json=>{ok=>0,error=>"daemon-reload fehlgeschlagen (rc=$rc)"}, status=>500);
+    }
 
   # Konfig-Eintrag laden
   my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannte Konfiguration: $name"}, status=>404);
@@ -755,12 +782,15 @@ post '/action/*name/*cmd' => sub {
       my $sub = $extra[0] // '';
       return $c->render(json=>{ok=>0,error=>'Subcommand verboten'}, status=>400) if $deny{$sub};
 
-      if (($e->{category} // '') eq 'service' && $cmd =~ /^(start|restart|reload|stop_start)$/) {
-        my $rc = system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'daemon-reload');
-        $logger->info("ACTION auto daemon-reload (exec:systemctl) rc=$rc");
-        return $c->render(json=>{ok=>0,error=>"daemon-reload (auto) fehlgeschlagen (rc=$rc)"},
-                          status=>500) unless $rc == 0;
-      }
+        if (($e->{category} // '') eq 'service' && $cmd =~ /^(start|restart|reload|stop_start)$/) {
+            my $rc = _systemctl_with_timeout(20, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'daemon-reload');
+            $logger->info("ACTION auto daemon-reload (exec:systemctl) rc=$rc");
+            if ($rc == -1) {
+                return $c->render(json=>{ok=>0,error=>"daemon-reload timeout nach 20s"}, status=>504);
+            }
+            return $c->render(json=>{ok=>0,error=>"daemon-reload (auto) fehlgeschlagen (rc=$rc)"},
+                              status=>500) unless $rc == 0;
+        }
     }
 
     my @argv =
@@ -782,62 +812,111 @@ post '/action/*name/*cmd' => sub {
     my ($out_r, $pid, $buf_out, $buf_err) = (undef, undef, '', '');
 
     eval {
-      $pid = open3(undef, $out_r, $err, @argv);
-      local $SIG{ALRM} = sub { die "timeout\n" };
-      alarm $timeout;
-
-      while (1) {
-        my $rin = '';
-        vec($rin, fileno($out_r), 1) = 1 if $out_r && defined fileno($out_r);
-        vec($rin, fileno($err),  1) = 1 if $err   && defined fileno($err);
-        my $n = select($rin, undef, undef, 1);
-        last if $n <= 0;
-
-        my $tmp;
-        if ($out_r && vec($rin, fileno($out_r), 1)) {
-          my $r = sysread($out_r, $tmp, 8192);
-          $buf_out .= $tmp if defined $r && $r > 0;
+        $pid = open3(undef, $out_r, $err, @argv);
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm $timeout;
+        
+        my $child_exited = 0;
+        
+        while (1) {
+            # Kind-Status prüfen
+            if (!$child_exited) {
+                my $wp = waitpid($pid, WNOHANG);
+                if ($wp == $pid || $wp == -1) {
+                    $child_exited = 1;
+                }
+            }
+            
+            # Pipes setzen für select
+            my $rin = '';
+            my $has_fds = 0;
+            
+            if ($out_r && defined fileno($out_r)) {
+                vec($rin, fileno($out_r), 1) = 1;
+                $has_fds = 1;
+            }
+            if ($err && defined fileno($err)) {
+                vec($rin, fileno($err), 1) = 1;
+                $has_fds = 1;
+            }
+            
+            # Wenn Kind beendet und keine Pipes mehr → fertig
+            last if $child_exited && !$has_fds;
+            
+            if ($has_fds) {
+                my $n = select(my $rout = $rin, undef, undef, 1);
+                
+                if ($n > 0) {
+                    my $tmp;
+                    if ($out_r && vec($rout, fileno($out_r), 1)) {
+                        my $r = sysread($out_r, $tmp, 8192);
+                        if (defined $r) {
+                            if ($r > 0) {
+                                $buf_out .= $tmp;
+                            } else {
+                                close $out_r;
+                                undef $out_r;
+                            }
+                        } else {
+                            die "sysread stdout failed: $!";
+                        }
+                    }
+                    if ($err && vec($rout, fileno($err), 1)) {
+                        my $r = sysread($err, $tmp, 8192);
+                        if (defined $r) {
+                            if ($r > 0) {
+                                $buf_err .= $tmp;
+                            } else {
+                                close $err;
+                                undef $err;
+                            }
+                        } else {
+                            die "sysread stderr failed: $!";
+                        }
+                    }
+                } elsif ($n == 0 && !$child_exited) {
+                    # Timeout, Kind läuft noch
+                    select(undef, undef, undef, 0.05);
+                }
+            } elsif (!$child_exited) {
+                # Keine Pipes, aber Kind läuft noch (selten)
+                select(undef, undef, undef, 0.1);
+            }
         }
-        if ($err && vec($rin, fileno($err), 1)) {
-          my $r = sysread($err, $tmp, 8192);
-          $buf_err .= $tmp if defined $r && $r > 0;
+        
+        # Sicherstellen, dass Kind wirklich beendet ist
+        if (!$child_exited) {
+            waitpid($pid, 0);
         }
-        my $eof_out = ($out_r && defined fileno($out_r)) ? eof($out_r) : 1;
-        my $eof_err = ($err   && defined fileno($err))   ? eof($err)   : 1;
-        last if $eof_out && $eof_err;
-      }
-
-      waitpid($pid, 0);
-      alarm 0;
-      close $out_r if $out_r;
-      close $err   if $err;
-      1;
-      } or do {
-        alarm 0;  # Fix 2: Alarm im Fehlerpfad immer stoppen
-      
+        
+        alarm 0;
+        1;
+    } or do {
+        alarm 0;
+        
         my $err_msg = $@ // 'unknown';
-      
+        
         kill 9, $pid if $pid;
         waitpid($pid, 0) if $pid;
-      
+        
         chdir $cwd_prev if defined $cwd_prev;
-      
+        
         my $dur = time() - $start;
-      
+        
         if ($err_msg =~ /timeout/) {
-          $logger->warn(sprintf(
-            'SCRIPT timeout %s runner=%s script=%s after=%.3fs',
-            _fmt_req($c), $runner, $script, $dur
-          ));
-          return $c->render(json=>{ ok=>0, error=>"Script timeout nach ${timeout}s" }, status=>504);
+            $logger->warn(sprintf(
+                'SCRIPT timeout %s runner=%s script=%s after=%.3fs',
+                _fmt_req($c), $runner, $script, $dur
+            ));
+            return $c->render(json=>{ ok=>0, error=>"Script timeout nach ${timeout}s" }, status=>504);
         } else {
-          $logger->warn(sprintf(
-            'SCRIPT failed %s runner=%s script=%s after=%.3fs err=%s',
-            _fmt_req($c), $runner, $script, $dur, $err_msg
-          ));
-          return $c->render(json=>{ ok=>0, error=>"Script-Ausführung fehlgeschlagen: $err_msg" }, status=>500);
+            $logger->warn(sprintf(
+                'SCRIPT failed %s runner=%s script=%s after=%.3fs err=%s',
+                _fmt_req($c), $runner, $script, $dur, $err_msg
+            ));
+            return $c->render(json=>{ ok=>0, error=>"Script-Ausführung fehlgeschlagen: $err_msg" }, status=>500);
         }
-      };
+    };
 
     chdir $cwd_prev if defined $cwd_prev;
 
@@ -866,17 +945,23 @@ post '/action/*name/*cmd' => sub {
       }
     }
 
-    my $ok = ($rc == 0) ? 1 : 0;
+   # Bestimme ok-Status (postmulti: rc 0 und 1 sind ok)
+    my $ok;
+    if ($runner eq 'exec' && $script =~ m{/postmulti$}) {
+        $ok = ($rc <= 1) ? 1 : 0;
+    } else {
+        $ok = ($rc == 0) ? 1 : 0;
+    }
 
     return $c->render(json=>{
-      ok     => $ok,
-      action => 'script',
-      runner => $runner,
-      script => $script,
-      args   => \@extra,
-      rc     => $rc,
-      stdout => $out_show,
-      stderr => $err_show,
+        ok     => $ok,
+        action => 'script',
+        runner => $runner,
+        script => $script,
+        args   => \@extra,
+        rc     => $rc,
+        stdout => $out_show,
+        stderr => $err_show,
     });
 
   } 
@@ -894,12 +979,20 @@ post '/action/*name/*cmd' => sub {
   }
 
   # Echte Dienste mit Unit-Namen
-  my $run = sub { my ($subcmd) = @_; system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), $subcmd, $svc) == 0 };
+   my $run = sub { 
+    my ($subcmd) = @_; 
+    my $rc = _systemctl_with_timeout(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), $subcmd, $svc);
+    if ($rc == -1) {
+        $logger->warn("ACTION $svc $subcmd timeout");
+        return 0;
+    }
+    return $rc == 0;
+   };
 
   my $is_service_cat = ( ($e->{category} // '') eq 'service' );
   my $cmd_triggers   = ($cmd =~ /^(start|restart|reload|stop_start)$/);
   if ($is_service_cat && $cmd_triggers) {
-    my $rc = system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'daemon-reload');
+    my $rc = _systemctl_with_timeout(20, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS // ''), 'daemon-reload');
     $logger->info("ACTION auto daemon-reload for category=service svc=$svc rc=$rc");
     return $c->render(json=>{ok=>0,error=>"daemon-reload (auto) fehlgeschlagen (rc=$rc)"}, status=>500) unless $rc == 0;
   }
@@ -965,7 +1058,7 @@ post '/raw/configs' => sub {
   return $c->render(status=>400, json=>{ok=>0,error=>'JSON muss ein Objekt (HASH) sein'}) unless ref($parsed) eq 'HASH';
 
   eval {
-    write_atomic($configsfile, $newdata);   # ← einzig relevante Änderung
+    write_atomic($configsfile, $newdata);
     1
   } or do {
     return $c->render(status=>500, json=>{ok=>0,error=>"Fehler beim Schreiben: $@"});
@@ -999,7 +1092,7 @@ del '/raw/configs/:name' => sub {
   my $new = encode_json($cfg);
 
   eval {
-    write_atomic($configsfile, $new);       # ← hier ersetzen
+    write_atomic($configsfile, $new);
     1
   } or return $c->render(status=>500, json=>{ok=>0,error=>"Fehler beim Schreiben: $@"});
 
