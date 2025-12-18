@@ -1,6 +1,11 @@
 #!/usr/bin/env perl
 # Config Manager — REST (actions schema, umask-first, hardened)
-# Version: 1.6.1 (2025-09-29)
+# Version: 1.6.2 (2025-12-18)
+#
+# Aenderungen gegenueber 1.6.1
+# Script Runner: Bei rc != 0 kein HTTP 500 mehr, sondern HTTP 200 mit ok Flag sowie rc/stdout/stderr im JSON (Warnungen von postmulti brechen die API nicht mehr ab).
+# Timeouts bleiben unveraendert als HTTP 504 (echte Haenger werden weiter klar signalisiert).
+# Ziel: Stabilere Automatisierung bei Postfix, Warnungen bleiben sichtbar, aber ohne Hard Fail.
 #
 # Änderungen ggü. 1.5.0:
 # - allowed_roots optional gemacht via path_guard: off|audit|enforce (Default: off)
@@ -51,7 +56,7 @@ use POSIX (); # fsync
 # ---------------- Umask (grundlegend) ----------------
 umask 0007;  # Dateien: 0660, Verzeichnisse: 0770 (sofern respektiert)
 
-my $VERSION = '1.6.1';
+my $VERSION = '1.6.2';
 
 # ---------------- systemctl (konfigurierbar) ----------------
 my $SYSTEMCTL       = '/usr/bin/systemctl';
