@@ -1019,6 +1019,51 @@ post '/action/*name/*cmd' => sub {
       }
     }
 
+    # status ist NIE ein Fehler, auch wenn rc != 0
+    if ($cmd eq 'status') {
+      my $st = ($rc == 0) ? 'running' : 'stopped';
+      return $c->render(json=>{
+        ok     => 1,
+        action => 'status',
+        runner => $runner,
+        script => $script,
+        args   => \@extra,
+        rc     => $rc,
+        status => $st,
+        stdout => $out_show,
+        stderr => $err_show,
+      });
+    }
+
+    # Optional: exec:systemctl is-active normalisieren
+    if ($is_systemctl_exec) {
+      my $sub = $extra[0] // '';
+      if ($sub eq 'is-active' && defined $extra[1]) {
+        my $u = $extra[1];
+        my $status2 = ($rc == 0) ? 'running' : 'stopped';
+        return $c->render(json=>{
+          ok=>1, action=>"exec-systemctl $cmd", unit=>$u, status=>$status2, rc=>$rc,
+          stdout => $out_show, stderr => $err_show
+        });
+      }
+    }
+
+    # postmulti: rc 0 und 1 sind ok (Warnings), aber kein Hard-Fail
+    if ($runner eq 'exec' && $script =~ m{/postmulti$}) {
+      my $ok = ($rc <= 1) ? 1 : 0;
+      return $c->render(json=>{
+        ok     => $ok,
+        action => 'script',
+        runner => $runner,
+        script => $script,
+        args   => \@extra,
+        rc     => $rc,
+        stdout => $out_show,
+        stderr => $err_show,
+      });
+    }
+
+    # Default
     my $ok = ($rc == 0) ? 1 : 0;
     return $c->render(json=>{
       ok     => $ok,
@@ -1030,7 +1075,6 @@ post '/action/*name/*cmd' => sub {
       stdout => $out_show,
       stderr => $err_show,
     });
-  }
 
   # Sonderfall: "service":"systemctl" Subcommand ohne Unit
   if ($svc eq 'systemctl') {
