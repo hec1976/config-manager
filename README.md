@@ -1,4 +1,4 @@
-# Config Manager (REST) — v1.6.1
+# Config Manager (REST) — v1.6.6
 
 Konfigurations-Dateien sicher lesen/schreiben per REST-API mit
 Backups, atomaren Writes und optionaler Rechte-Anpassung (owner/mode).
