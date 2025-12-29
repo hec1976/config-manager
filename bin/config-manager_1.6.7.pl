@@ -70,16 +70,16 @@ my $logfile = $global->{logfile} // "/var/log/mmbb/config-manager.log";
 my $logdir  = dirname($logfile);
 
 # Log-Verzeichnis erstellen, falls nicht vorhanden
-unless (-d $logdir) {
+if (!-d $logdir) {
     eval { mkdir $logdir, 0755; 1 };
-    if ($@ || !-d $logdir) {
-        $log->warn("Konnte Log-Verzeichnis $logdir nicht erstellen. Logging auf STDERR.");
-    }
-    else {
-        $log->path($logfile);
-        $log->info("Logging in Datei $logfile aktiviert.");
-    }
+}
 
+if (-d $logdir) {
+    $log->path($logfile);
+    $log->info("Logging in Datei $logfile aktiviert.");
+} else {
+    $log->warn("Konnte Log-Verzeichnis $logdir nicht nutzen. Logging auf STDERR.");
+}
 # ---------------- Mojolicious Secrets ----------------
 my $sec = $global->{secret};
 my @secrets = ref($sec) eq 'ARRAY' ? @$sec : ($sec // 'change-this-long-random-secret-please');
