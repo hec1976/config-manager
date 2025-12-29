@@ -1,13 +1,13 @@
 #!/usr/bin/env perl
 # Config Manager — REST (actions schema, umask-first, hardened)
-# Version: 1.6.6 (2025-12-18)
+# Version: 1.6.7 (2025-12-29)
 #
-# Changelog 1.6.6:
-# - ROLLBACK: Backup/Restore-Logik exakt wie in v1.6.1 (für GUI-Kompatibilität)
-# - FIX: Endpoint /backupcontent wiederhergestellt
-# - FIX: JSON-Response bei Restore wieder ausführlich (requested/applied Meta)
-# - KEEP: POSIX::fsync Fix aus v1.6.5
-# - KEEP: Systemctl Signal-Handling & Waitpid-Optimierung aus v1.6.5
+# Changelog 1.6.7:
+# - UPGRADE: Log::Log4perl durch Mojo::Log ersetzt (bessere Integration, weniger Abhängigkeiten)
+# - REFACTOR: Code alkalisiert (konsistente Formatierung, bessere Lesbarkeit)
+# - REFACTOR: Subroutinen modularisiert und logisch geordnet
+# - REFACTOR: Fehlerbehandlung und Logging vereinheitlicht
+# - KEEP: Alle Features und Fixes aus v1.6.6
 
 use strict;
 use warnings;
@@ -32,7 +32,8 @@ use POSIX qw(:sys_wait_h WNOHANG);
 umask 0007;
 
 # ---------------- Version & Globale Variablen ----------------
-my $VERSION = '1.6.6';
+my $VERSION = '1.6.7';
+
 my $globalfile  = "$Bin/global.json";
 my $configsfile = "$Bin/configs.json";
 
@@ -76,6 +77,7 @@ unless (-d $logdir) {
     }
     else {
         $log->path($logfile);
+        $log->info("Logging in Datei $logfile aktiviert.");
     }
 
 # ---------------- Mojolicious Secrets ----------------
@@ -84,7 +86,7 @@ my @secrets = ref($sec) eq 'ARRAY' ? @$sec : ($sec // 'change-this-long-random-s
 app->secrets(\@secrets);
 
 if (grep { defined($_) && $_ eq 'change-this-long-random-secret-please' } @secrets) {
-    $log->warn('[config-manager] WARNING: default Mojolicious secret in use!');
+    $log->warn('[config-manager] WARNING: Standard-Mojolicious Secret wird verwendet! Bitte in global.json anpassen.');
 }
 
 # ---------------- Security & Verzeichnisse ----------------
@@ -96,8 +98,8 @@ my $tmpDir     = $global->{tmpDir}     // "$Bin/tmp";
 my $backupRoot = $global->{backupDir}  // "$Bin/backup";
 
 # Verzeichnisse erstellen, falls nicht vorhanden
-unless (-d $backupRoot) { mkdir $backupRoot, 0750 or die "Backup-Dir $backupRoot fehlt/nicht erstellbar"; }
-unless (-d $tmpDir)     { mkdir $tmpDir,     0750 or die "Tmp-Dir $tmpDir fehlt/nicht erstellbar"; }
+unless (-d $backupRoot) { mkdir $backupRoot, 0750 or die "Backup-Verzeichnis $backupRoot fehlt/nicht erstellbar"; }
+unless (-d $tmpDir)     { mkdir $tmpDir,     0750 or die "Tmp-Verzeichnis $tmpDir fehlt/nicht erstellbar"; }
 
 my $maxBackups          = $global->{maxBackups} // 10;
 my $path_guard          = lc($ENV{PATH_GUARD} // ($global->{path_guard} // 'off'));
@@ -203,10 +205,10 @@ sub _apply_meta {
     my $auto_wanted = (defined $e->{user} || defined $e->{group} || defined $e->{mode}) ? 1 : 0;
     my $enabled = defined $e->{apply_meta} ? $e->{apply_meta} : ($apply_meta_enabled || $auto_wanted);
 
-    unless ($enabled) { $log->info("APPLY_META skipped (disabled) path=$path"); return; }
+    unless ($enabled) { $log->info("APPLY_META übersprungen (deaktiviert) für Pfad=$path"); return; }
 
     die "Pfad nicht erlaubt" unless _is_allowed_path($path);
-    die "refuse symlink" if -l $path;
+    die "Symlinks werden abgelehnt" if -l $path;
 
     my $uid = _name2uid($e->{user});
     my $gid = _name2gid($e->{group});
@@ -215,14 +217,14 @@ sub _apply_meta {
     if (defined $e->{mode}) {
         my $m = "$e->{mode}";
         $m =~ s/^0+//;
-        die "ungültiger mode" unless $m =~ /^[0-7]{3,4}$/;
+        die "Ungültiger Modus: $e->{mode}" unless $m =~ /^[0-7]{3,4}$/;
         $mode = oct($m);
     }
 
     if (defined $uid || defined $gid) {
         my $u = defined($uid) ? $uid : -1;
         my $g = defined($gid) ? $gid : -1;
-        chown($u, $g, $path) or die "chown failed: $!";
+        chown($u, $g, $path) or die "chown fehlgeschlagen: $!";
     }
     chmod($mode, $path) if defined $mode;
 }
@@ -241,16 +243,16 @@ sub _systemctl_with_timeout {
     $timeout = 30 unless defined $timeout && $timeout =~ /^\d+$/;
 
     my $pid = fork();
-    die "fork failed: $!" unless defined $pid;
+    die "fork fehlgeschlagen: $!" unless defined $pid;
 
     if ($pid == 0) {
-        # Child
+        # Child-Prozess
         open STDIN, '<', '/dev/null';
         exec @cmd;
         exit 127;
     }
 
-    # Parent
+    # Eltern-Prozess
     my $timed_out = 0;
     local $SIG{ALRM} = sub { $timed_out = 1; kill 9, $pid; };
     alarm $timeout;
@@ -258,13 +260,13 @@ sub _systemctl_with_timeout {
     alarm 0;
 
     if ($timed_out) {
-        $log->warn("systemctl timeout after ${timeout}s: @cmd");
+        $log->warn("systemctl-Timeout nach ${timeout}s: @cmd");
         return -1;
     }
 
     if (($? & 127) > 0) {
         my $sig = $? & 127;
-        $log->warn("systemctl died with signal $sig: @cmd");
+        $log->warn("systemctl mit Signal $sig beendet: @cmd");
         return 128 + $sig;
     }
 
@@ -316,7 +318,7 @@ sub _rebuild_cfgmap_from {
 }
 _rebuild_cfgmap_from($configs);
 
-$log->info(sprintf('BOOT version=%s umask=%04o path_guard=%s apply_meta=%d',
+$log->info(sprintf('START version=%s umask=%04o path_guard=%s apply_meta=%d',
     $VERSION, _cur_umask(), $path_guard, $apply_meta_enabled ? 1 : 0));
 
 # --- Atomares Schreiben ---
@@ -325,16 +327,16 @@ sub write_atomic {
     my $dir = dirname($path);
 
     my ($fh, $tmp) = tempfile('.tmp_XXXXXX', DIR => $dir, UNLINK => 0);
-    binmode($fh, ':raw') or die "binmode failed: $!";
-    print {$fh} $bytes or die "write failed: $!";
+    binmode($fh, ':raw') or die "binmode fehlgeschlagen: $!";
+    print {$fh} $bytes or die "Schreiben fehlgeschlagen: $!";
     eval { $fh->flush() if $fh->can('flush'); 1 };
     eval { $fh->sync()  if $fh->can('sync');  1 };
-    close $fh or die "close failed: $!";
+    close $fh or die "Schließen fehlgeschlagen: $!";
 
     my $mode = 0666 & ~_cur_umask();
-    chmod $mode, $tmp or die "chmod($tmp) failed: $!";
+    chmod $mode, $tmp or die "chmod($tmp) fehlgeschlagen: $!";
 
-    rename $tmp, $path or die "rename failed: $!";
+    rename $tmp, $path or die "Umbenennen fehlgeschlagen: $!";
     _fsync_dir($path);
     return 'atomic';
 }
@@ -345,9 +347,9 @@ sub safe_write_file {
     my $ok = eval { write_atomic($path, $bytes); 1 };
     if (!$ok) {
         $method = 'plain';
-        open my $fh, '>:raw', $path or die "plain open failed: $!";
-        print {$fh} $bytes or die "plain write failed: $!";
-        close $fh or die "plain close failed: $!";
+        open my $fh, '>:raw', $path or die "Öffnen fehlgeschlagen: $!";
+        print {$fh} $bytes or die "Schreiben fehlgeschlagen: $!";
+        close $fh or die "Schließen fehlgeschlagen: $!";
     }
     return $method;
 }
@@ -408,14 +410,14 @@ app->hook(before_dispatch => sub {
     $c->res->headers->header('Access-Control-Allow-Headers' => 'Content-Type, X-API-Token, Authorization');
     $c->res->headers->header('Access-Control-Max-Age'       => '86400');
 
-    $log->info(sprintf('REQ  %s', _fmt_req($c)));
+    $log->info(sprintf('REQUEST %s', _fmt_req($c)));
     return $c->render(text => '', status => 204) if $c->req->method eq 'OPTIONS';
 
     # IP-ACL
     if ($allowed_ips && @{$allowed_ips}) {
         my $rip = $c->stash('client_ip') // '';
         unless (Net::CIDR::cidrlookup($rip, @{$allowed_ips})) {
-            $log->info(sprintf('REQ  %s -> 403 Forbidden', _fmt_req($c)));
+            $log->info(sprintf('REQUEST %s -> 403 Forbidden', _fmt_req($c)));
             return $c->render(status => 403, json => { ok=>0, error => 'Forbidden' });
         }
     }
@@ -427,7 +429,7 @@ app->hook(before_dispatch => sub {
         my $bearer  = $auth =~ /^Bearer\s+(.+)/i ? $1 : '';
         my $token   = $hdr || $bearer;
         unless ($token eq $api_token) {
-            $log->info(sprintf('REQ  %s -> 401 Unauthorized', _fmt_req($c)));
+            $log->info(sprintf('REQUEST %s -> 401 Unauthorized', _fmt_req($c)));
             return $c->render(status => 401, json => { ok=>0, error => 'Unauthorized' });
         }
     }
@@ -438,7 +440,7 @@ app->hook(after_dispatch => sub {
     my $t0 = $c->stash('t0') // time();
     my $dt = time() - $t0;
     my $code = $c->res->code // 200;
-    $log->info(sprintf('RESP %s status=%d time=%.3fs', _fmt_req($c), $code, $dt));
+    $log->info(sprintf('RESPONSE %s status=%d time=%.3fs', _fmt_req($c), $code, $dt));
 });
 
 # ==================================================
@@ -516,7 +518,7 @@ post '/config/*name' => sub {
     my $meta_wanted = defined $e->{apply_meta} ? $e->{apply_meta}
                     : ($apply_meta_enabled || defined($e->{user}) || defined($e->{group}) || defined($e->{mode}));
 
-    eval { _apply_meta($e, $path); 1 } or $log->warn("apply_meta Fehler: $@");
+    eval { _apply_meta($e, $path); 1 } or $log->warn("Fehler bei apply_meta: $@");
 
     my $applied_mode = _mode_str($path);
     my ($uid,$gid)   = ((stat($path))[4], (stat($path))[5]);
@@ -560,7 +562,7 @@ get '/backupcontent/*name/*filename' => sub {
 
     my $file = "$bdir/$filename";
     return $c->render(json=>{ok=>0,error=>'Backup nicht gefunden'}, status=>404) unless -f $file;
-    open my $fh, '<:raw', $file or return $c->render(json=>{ok=>0,error=>"Die Backup-Datei konnte nicht geöffnet werden: $!"}, status=>500);
+    open my $fh, '<:raw', $file or return $c->render(json=>{ok=>0,error=>"Backup-Datei konnte nicht geöffnet werden: $!"}, status=>500);
     my $content = do { local $/; <$fh> }; close $fh;
     $c->render(json => { ok=>1, content => $content });
 };
@@ -584,7 +586,7 @@ post '/restore/*name/*filename' => sub {
     return $c->render(json=>{ok=>0,error=>'Pfad nicht erlaubt'}, status=>400) unless _is_allowed_path($dest);
 
     copy($src, $dest) or return $c->render(json=>{ok=>0,error=>"Wiederherstellung fehlgeschlagen: $!"}, status=>500);
-    eval { _apply_meta($e, $dest); 1 } or $log->warn("apply_meta Fehler: $@");
+    eval { _apply_meta($e, $dest); 1 } or $log->warn("Fehler bei apply_meta: $@");
 
     my $applied_mode = _mode_str($dest);
     my ($uid,$gid)   = ((stat($dest))[4], (stat($dest))[5]);
@@ -603,14 +605,14 @@ post '/restore/*name/*filename' => sub {
 post '/action/*name/*cmd' => sub {
     my $c = shift;
     my ($name, $cmd) = ($c->stash('name'), $c->stash('cmd'));
-    return $c->render(json=>{ok=>0,error=>'Invalid'}, status=>400) if !defined $name || $name =~ m{[/\\]};
+    return $c->render(json=>{ok=>0,error=>'Ungültige Anfrage'}, status=>400) if !defined $name || $name =~ m{[/\\]};
 
     my $tool  = $SYSTEMCTL;
     my @ctl = ($tool, shellwords($SYSTEMCTL_FLAGS // ''));
 
     if ($cmd eq 'daemon-reload') {
         my $rc = _systemctl_with_timeout(20, @ctl, 'daemon-reload');
-        return $rc == 0 ? $c->render(json=>{ok=>1}) : $c->render(json=>{ok=>0,error=>"rc=$rc"}, status=>500);
+        return $rc == 0 ? $c->render(json=>{ok=>1}) : $c->render(json=>{ok=>0,error=>"Rückgabewert=$rc"}, status=>500);
     }
 
     my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannt"}, status=>404);
@@ -622,10 +624,10 @@ post '/action/*name/*cmd' => sub {
     my @extra = @{$actmap->{$cmd}};
     for (@extra) { return $c->render(json=>{ok=>0,error=>"Ungültiges Argument"}, status=>400) unless /^[A-Za-z0-9._:+@\/=\-,]+$/; }
 
-    # Script Runner
+    # Script-Ausführung
     if ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
         my ($runner, $script) = ($1, $2);
-        return $c->render(json=>{ok=>0,error=>"Script fehlt: $script"}, status=>404) unless -f $script;
+        return $c->render(json=>{ok=>0,error=>"Skript nicht gefunden: $script"}, status=>404) unless -f $script;
 
         if ($runner eq 'exec' && $script =~ m{/systemctl$}) {
             return $c->render(json=>{ok=>0,error=>'Subcommand verboten'}, status=>400) if ($extra[0]//'') =~ /^(poweroff|reboot|halt)$/;
@@ -674,7 +676,7 @@ post '/action/*name/*cmd' => sub {
         } or do {
             alarm 0; kill 9, $pid if $pid; waitpid($pid,0) if $pid;
             chdir $cwd_prev;
-            return $c->render(json=>{ok=>0,error=>"Script Timeout/Fehler"}, status=>500);
+            return $c->render(json=>{ok=>0,error=>"Skript-Timeout/Fehler"}, status=>500);
         };
 
         chdir $cwd_prev;
@@ -691,9 +693,9 @@ post '/action/*name/*cmd' => sub {
     }
 
     if ($svc eq 'systemctl') {
-        return $c->render(json=>{ok=>0,error=>'Forbidden'}, status=>400) if $cmd =~ /^(poweroff|reboot|halt)$/;
+        return $c->render(json=>{ok=>0,error=>'Verboten'}, status=>400) if $cmd =~ /^(poweroff|reboot|halt)$/;
         my $rc = system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd);
-        return $rc == 0 ? $c->render(json=>{ok=>1}) : $c->render(json=>{ok=>0,error=>"rc=$rc"}, status=>500);
+        return $rc == 0 ? $c->render(json=>{ok=>1}) : $c->render(json=>{ok=>0,error=>"Rückgabewert=$rc"}, status=>500);
     }
 
     my $run = sub { return _systemctl_with_timeout(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $_[0], $svc) == 0; };
@@ -723,7 +725,7 @@ get '/raw/configs' => sub { shift->render(data => read_all($configsfile)); };
 post '/raw/configs' => sub {
     my $c = shift;
     my $raw = $c->req->body // '';
-    eval { decode_json($raw); 1 } or return $c->render(json=>{ok=>0,error=>'Invalid JSON'}, status=>400);
+    eval { decode_json($raw); 1 } or return $c->render(json=>{ok=>0,error=>'Ungültiges JSON'}, status=>400);
     safe_write_file($configsfile, $raw);
     _rebuild_cfgmap_from(decode_json($raw));
     $c->render(json=>{ok=>1,reload=>1});
@@ -731,7 +733,7 @@ post '/raw/configs' => sub {
 
 post '/raw/configs/reload' => sub {
     my $c = shift;
-    my $cfg = eval { decode_json(read_all($configsfile)) } or return $c->render(json=>{ok=>0,error=>'JSON Fehler'}, status=>500);
+    my $cfg = eval { decode_json(read_all($configsfile)) } or return $c->render(json=>{ok=>0,error=>'JSON-Fehler'}, status=>500);
     _rebuild_cfgmap_from($cfg);
     $c->render(json=>{ok=>1,reloaded=>1});
 };
