@@ -73,6 +73,12 @@ BindReadOnlyPaths=/etc/nsswitch.conf
 BindReadOnlyPaths=/etc/localtime
 BindReadOnlyPaths=/etc/machine-id
 
+# Kommunikation mit systemd-Manager
+BindReadOnlyPaths=/run/dbus/system_bus_socket
+
+# Prozess-Tracking & Status-Abfrage
+BindReadOnlyPaths=/sys/fs/cgroup
+
 # Journal NUR wenn benötigt:
 # BindReadOnlyPaths=/run/systemd/journal:/run/systemd/journal
 # SupplementaryGroups=systemd-journal
