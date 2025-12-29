@@ -2,9 +2,9 @@
 # Config Manager — configs.json
 
 ## Übersicht
-Die Datei `configs.json` definiert die Konfigurationen, die vom **Config Manager** verwaltet werden. Jeder Eintrag beschreibt eine Konfigurationsdatei, ihre Berechtigungen, zugehörige Dienste, erlaubte Aktionen und optionale Metadaten wie Backups oder Validierungen.
+Die Datei `configs.json` definiert die Konfigurationen, die vom **Config Manager** verwaltet werden. Jeder Eintrag beschreibt eine Konfigurationsdatei, ihre Berechtigungen, zugehörige Dienste und erlaubte Aktionen.
 
-Diese Anleitung erklärt die Struktur, Felder und Best Practices für die `configs.json`.
+Diese Anleitung erklärt die **tatsächlich unterstützten Felder** und deren Verwendung.
 
 ---
 
@@ -13,10 +13,6 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
 
 ```json
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "$comment": "Config Manager — configs.json (v1.6.7)",
-  "description": "Definiert die zu verwaltenden Konfigurationen, inkl. Pfade, Aktionen, Berechtigungen und Metadaten.",
-
   "konfigurationsname": {
     "path": "/pfad/zur/datei",
     "category": "kategorie",
@@ -28,41 +24,30 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
     "user": "benutzer",
     "group": "gruppe",
     "mode": "0644",
-    "apply_meta": true,
-    "backup_dir": "/pfad/zu/backups",
-    "max_backups": 5,
-    "description": "Beschreibung der Konfiguration",
-    "validation": {
-      "required_vars": ["VAR1", "VAR2"],
-      "template": "/pfad/zur/vorlage"
-    }
+    "apply_meta": true
   }
 }
 ```
 
 ---
 
-## Felder im Detail
+## Unterstützte Felder
 
 ### Pflichtfelder
-| Feld          | Typ          | Beschreibung                                                                                     |
-|---------------|--------------|-------------------------------------------------------------------------------------------------|
-| `path`        | String       | **Pflichtfeld.** Pfad zur Konfigurationsdatei.                                                   |
-| `actions`     | Objekt       | **Pflichtfeld.** Definiert die erlaubten Aktionen für diese Konfiguration.                       |
+| Feld      | Typ          | Beschreibung                                                                                     |
+|-----------|--------------|-------------------------------------------------------------------------------------------------|
+| `path`    | String       | **Pflichtfeld.** Pfad zur Konfigurationsdatei.                                                   |
+| `actions` | Objekt       | **Pflichtfeld.** Definiert die erlaubten Aktionen für diese Konfiguration.                       |
 
 ### Optionale Felder
-| Feld          | Typ          | Beschreibung                                                                                     |
-|---------------|--------------|-------------------------------------------------------------------------------------------------|
-| `category`    | String       | Kategorie zur Gruppierung (z. B. `webserver`, `application`, `mail`).                            |
-| `service`     | String       | Name des zugehörigen systemd-Dienstes (z. B. `nginx`).                                           |
-| `user`        | String       | Benutzer, dem die Datei gehören soll. Standard: `root`.                                          |
-| `group`       | String       | Gruppe, der die Datei gehören soll. Standard: `root`.                                           |
-| `mode`        | String       | Dateiberechtigungen (z. B. `0644`). Standard: `0644`.                                            |
-| `apply_meta`  | Boolean      | Legt fest, ob Benutzer, Gruppe und Modus angewendet werden sollen. Standard: `true`.            |
-| `backup_dir`  | String       | Individueller Pfad für Backups. Standard: `<backupRoot>/<name>`.                                 |
-| `max_backups` | Integer      | Maximale Anzahl der Backups. Überschreibt den globalen Wert.                                    |
-| `description` | String       | Beschreibung der Konfiguration.                                                                 |
-| `validation`  | Objekt       | Definiert Validierungsregeln (z. B. erforderliche Variablen oder eine Vorlage).                 |
+| Feld         | Typ          | Beschreibung                                                                                     |
+|--------------|--------------|-------------------------------------------------------------------------------------------------|
+| `category`   | String       | Kategorie zur Gruppierung (z. B. `webserver`, `application`).                                   |
+| `service`    | String       | Name des zugehörigen systemd-Dienstes (z. B. `nginx`).                                           |
+| `user`       | String       | Benutzer, dem die Datei gehören soll. Standard: `root`.                                          |
+| `group`      | String       | Gruppe, der die Datei gehören soll. Standard: `root`.                                           |
+| `mode`       | String       | Dateiberechtigungen (z. B. `0644`). Standard: `0644`.                                            |
+| `apply_meta` | Boolean      | Legt fest, ob Benutzer, Gruppe und Modus angewendet werden sollen. Standard: `true`.            |
 
 ---
 
@@ -75,6 +60,7 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
 
 ### `category`
 - Dient der Gruppierung von Konfigurationen (z. B. `webserver`, `mail`, `security`).
+- Wird in der API-Antwort (`/configs`) zurückgegeben, aber nicht funktional genutzt.
 - Beispiel: `"category": "webserver"`.
 
 ### `service`
@@ -91,12 +77,13 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
   "actions": {
     "reload": [],
     "restart": ["--no-block"],
-    "check": ["postfix", "check"]
+    "run": ["/opt/scripts/restart_app.sh"]
   }
   ```
 
 ### `user`, `group`, `mode`
 - Legt fest, wem die Datei gehören soll und welche Berechtigungen sie haben soll.
+- Wird nur angewendet, wenn `apply_meta` auf `true` gesetzt ist.
 - Beispiel:
   ```json
   "user": "appuser",
@@ -108,31 +95,6 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
 - Legt fest, ob die Metadaten (`user`, `group`, `mode`) auf die Datei angewendet werden sollen.
 - Standard: `true`.
 - Beispiel: `"apply_meta": true`.
-
-### `backup_dir`
-- Überschreibt den Standard-Backup-Pfad für diese Konfiguration.
-- Beispiel: `"backup_dir": "/var/backups/nginx"`.
-
-### `max_backups`
-- Überschreibt die globale Einstellung für die maximale Anzahl der Backups.
-- Beispiel: `"max_backups": 5`.
-
-### `description`
-- Beschreibung der Konfiguration, z. B. ihr Zweck oder Hinweise zur Bearbeitung.
-- Beispiel: `"description": "Hauptkonfiguration für Nginx. Änderungen erfordern einen Reload."`.
-
-### `validation`
-- Definiert Regeln zur Validierung der Konfiguration.
-- Unterstützt:
-  - `required_vars`: Liste der erforderlichen Variablen (für z. B. `.env`-Dateien).
-  - `template`: Pfad zu einer Vorlagendatei, mit der die Konfiguration verglichen wird.
-- Beispiel:
-  ```json
-  "validation": {
-    "required_vars": ["DB_HOST", "DB_USER"],
-    "template": "/opt/templates/app.env.template"
-  }
-  ```
 
 ---
 
@@ -147,15 +109,12 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
   "actions": {
     "status": [],
     "reload": [],
-    "restart": ["--no-block"]
+    "restart": []
   },
   "user": "root",
   "group": "root",
   "mode": "0644",
-  "apply_meta": true,
-  "backup_dir": "/var/backups/nginx",
-  "max_backups": 5,
-  "description": "Hauptkonfiguration für Nginx. Änderungen erfordern einen Reload oder Restart."
+  "apply_meta": true
 }
 ```
 
@@ -170,12 +129,7 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
   "user": "appuser",
   "group": "appgroup",
   "mode": "0640",
-  "apply_meta": true,
-  "description": "Umgebungsvariablen für die Anwendung. Wird beim Deployment aktualisiert.",
-  "validation": {
-    "required_vars": ["DB_HOST", "DB_USER", "API_KEY"],
-    "template": "/opt/templates/app.env.template"
-  }
+  "apply_meta": true
 }
 ```
 
@@ -192,8 +146,7 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
   "user": "root",
   "group": "postfix",
   "mode": "0640",
-  "apply_meta": true,
-  "description": "Postfix-Hauptkonfiguration. Nach Änderungen 'postfix check' ausführen."
+  "apply_meta": true
 }
 ```
 
@@ -203,31 +156,25 @@ Die `configs.json` ist ein JSON-Objekt, in dem jeder Schlüssel den Namen einer 
 
 1. **Kategorien nutzen:** Verwende klare Kategorien wie `webserver`, `database`, `security`, um Konfigurationen zu gruppieren.
 2. **Berechtigungen einschränken:** Verwende spezifische Benutzer und Gruppen (z. B. `appuser:appgroup` statt `root:root`).
-3. **Beschreibungen hinzufügen:** Dokumentiere den Zweck und Besonderheiten jeder Konfiguration.
-4. **Validierung nutzen:** Für kritische Konfigurationen (z. B. `.env`-Dateien) solltest du `required_vars` oder `template` verwenden.
-5. **Backups individuell steuern:** Nutze `backup_dir` und `max_backups` für wichtige Konfigurationen.
-6. **Aktionen sinnvoll wählen:** Definiere nur Aktionen, die für die Konfiguration relevant sind (z. B. `reload` für Nginx, `check` für Postfix).
+3. **Aktionen sinnvoll wählen:** Definiere nur Aktionen, die für die Konfiguration relevant sind (z. B. `reload` für Nginx, `check` für Postfix).
+4. **`apply_meta` nutzen:** Aktiviere `apply_meta`, um sicherzustellen, dass Berechtigungen korrekt gesetzt werden.
 
 ---
 
 ## Integration mit dem Config Manager
 
 ### Kompatibilität
-Die `configs.json` ist vollständig kompatibel mit dem **Config Manager**-Skript (`config-manager.pl`). Das Skript unterstützt alle oben genannten Felder und Funktionen.
+Die `configs.json` ist vollständig kompatibel mit dem **Config Manager**-Skript (`config-manager.pl`). Das Skript unterstützt **nur die oben genannten Felder**.
 
-### Erweiterte Funktionen
-- **Validierung:** Die Validierung wird nicht direkt vom Skript durchgeführt, kann aber in Hooks oder Skripten (z. B. in `actions`) integriert werden.
-- **Individuelle Backup-Pfade:** Das Skript verwendet standardmäßig `<backupRoot>/<name>`, aber du kannst dies durch Anpassen der Funktion `_backup_dir_for` im Skript ändern.
+### Backups
+- Backups werden standardmäßig im Verzeichnis `<backupRoot>/<name>` gespeichert.
+- Die maximale Anzahl der Backups wird global in der `global.json` (`maxBackups`) definiert.
 
 ---
 
 ## Beispiel für eine vollständige configs.json
 ```json
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "$comment": "Config Manager — configs.json (v1.6.7)",
-  "description": "Definiert die zu verwaltenden Konfigurationen, inkl. Pfade, Aktionen, Berechtigungen und Metadaten.",
-
   "nginx_conf": {
     "path": "/etc/nginx/nginx.conf",
     "category": "webserver",
@@ -235,15 +182,12 @@ Die `configs.json` ist vollständig kompatibel mit dem **Config Manager**-Skript
     "actions": {
       "status": [],
       "reload": [],
-      "restart": ["--no-block"]
+      "restart": []
     },
     "user": "root",
     "group": "root",
     "mode": "0644",
-    "apply_meta": true,
-    "backup_dir": "/var/backups/nginx",
-    "max_backups": 5,
-    "description": "Hauptkonfiguration für Nginx. Änderungen erfordern einen Reload oder Restart."
+    "apply_meta": true
   },
 
   "app_env": {
@@ -255,15 +199,21 @@ Die `configs.json` ist vollständig kompatibel mit dem **Config Manager**-Skript
     "user": "appuser",
     "group": "appgroup",
     "mode": "0640",
-    "apply_meta": true,
-    "description": "Umgebungsvariablen für die Anwendung. Wird beim Deployment aktualisiert.",
-    "validation": {
-      "required_vars": ["DB_HOST", "DB_USER", "API_KEY"],
-      "template": "/opt/templates/app.env.template"
-    }
+    "apply_meta": true
   }
 }
 ```
+
+---
+
+## Nicht unterstützte Felder
+Die folgenden Felder werden **nicht** vom Skript verarbeitet und sollten vermieden werden:
+- `backup_dir`
+- `max_backups`
+- `description`
+- `validation`
+
+Falls du diese Felder nutzen möchtest, musst du das Skript entsprechend erweitern.
 
 ---
 
