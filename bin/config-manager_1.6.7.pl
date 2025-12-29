@@ -450,30 +450,22 @@ app->hook(after_dispatch => sub {
 # --- Root (mit Routen-Auflistung) ---
 get '/' => sub {
     my $c = shift;
-    
     my @routes_list;
-    # Iteriert durch alle Kinder des Routers
     foreach my $route (@{app->routes->children}) {
-        # Extrahiere die HTTP-Methoden (GET, POST, etc.)
+        next unless ref $route;
         my $methods = $route->via;
-        my $method_str = (ref $methods eq 'ARRAY' && @$methods) 
-                         ? join(', ', map { uc } @$methods) 
+        my $method_str = (ref $methods eq 'ARRAY' && @$methods)
+                         ? join(', ', map { uc } @$methods)
                          : 'ANY';
-
-        # Den Pfad-String abrufen
         my $path = $route->to_string;
-
-        push @routes_list, {
-            method => $method_str,
-            path   => $path
-        };
+        push @routes_list, { method => $method_str, path => $path };
     }
-
-    $c->render(json => { 
-        ok      => 1, 
-        name    => 'config-manager', 
-        version => $VERSION,
-        api_endpoints => \@routes_list 
+    @routes_list = sort { $a->{path} cmp $b->{path} } @routes_list;
+    $c->render(json => {
+        ok           => 1,
+        name         => 'config-manager',
+        version      => $VERSION,
+        api_endpoints => \@routes_list
     });
 };
 
