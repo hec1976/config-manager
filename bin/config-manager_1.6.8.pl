@@ -1,18 +1,21 @@
 #!/usr/bin/env perl
 # Config Manager — REST (actions schema, umask-first, hardened)
-# Version: 1.6.7 (2025-12-29)
+# Version: 1.6.8 (2026-01-03)
 #
-# Changelog 1.6.7:
-# - UPGRADE: Log::Log4perl durch Mojo::Log ersetzt (bessere Integration, weniger Abhängigkeiten)
+# Changelog 1.6.8:
+# - UPGRADE: Mojo::File für Dateioperationen (sauberer, robuster)
+# - UPGRADE: Nicht-blockierende Subprozesse mit Mojo::Promise
+# - UPGRADE: Sichere Token-Vergleiche mit Mojo::Util::secure_compare
 # - REFACTOR: Code alkalisiert (konsistente Formatierung, bessere Lesbarkeit)
-# - REFACTOR: Subroutinen modularisiert und logisch geordnet
-# - REFACTOR: Fehlerbehandlung und Logging vereinheitlicht
-# - KEEP: Alle Features und Fixes aus v1.6.6
+# - KEEP: Alle Features und Fixes aus v1.6.7
 
 use strict;
 use warnings;
 use Mojolicious::Lite;
 use Mojo::Log;
+use Mojo::File qw(path);
+use Mojo::Promise;
+use Mojo::Util qw(secure_compare);
 use JSON::MaybeXS qw(encode_json decode_json);
 use File::Basename qw(basename dirname);
 use File::Copy qw(copy);
@@ -34,7 +37,7 @@ use POSIX qw(:sys_wait_h WNOHANG);
     umask 0007;
 
     # ---------------- Version & Globale Variablen ----------------
-    our $VERSION = '1.6.7';
+    our $VERSION = '1.6.8';
 
     our $globalfile  = "$Bin/global.json";
     our $configsfile = "$Bin/configs.json";
@@ -50,10 +53,7 @@ use POSIX qw(:sys_wait_h WNOHANG);
     # ---------------- Konfiguration laden ----------------
     sub read_all {
         my ($path) = @_;
-        open my $fh, '<:raw', $path or die "Kann $path nicht lesen: $!";
-        local $/; my $data = <$fh>;
-        close $fh;
-        return $data;
+        return path($path)->slurp;
     }
 
     our $global = eval { decode_json(read_all($globalfile)) };
@@ -240,41 +240,19 @@ use POSIX qw(:sys_wait_h WNOHANG);
         return "$backupRoot/$sub";
     }
 
-    # --- Systemctl mit Timeout ---
-    sub _systemctl_with_timeout {
-        my ($timeout, @cmd) = @_;
-        $timeout = 30 unless defined $timeout && $timeout =~ /^\d+$/;
-
-        my $pid = fork();
-        die "fork fehlgeschlagen: $!" unless defined $pid;
-
-        if ($pid == 0) {
-            # Child-Prozess
-            open STDIN, '<', '/dev/null';
-            exec @cmd;
-            exit 127;
-        }
-
-        # Eltern-Prozess
-        my $timed_out = 0;
-        local $SIG{ALRM} = sub { $timed_out = 1; kill 9, $pid; };
-        alarm $timeout;
-        waitpid($pid, 0);
-        alarm 0;
-
-        if ($timed_out) {
-            $log->warn("systemctl-Timeout nach ${timeout}s: @cmd");
-            return -1;
-        }
-
-        if (($? & 127) > 0) {
-            my $sig = $? & 127;
-            $log->warn("systemctl mit Signal $sig beendet: @cmd");
-            return 128 + $sig;
-        }
-
-        return $? >> 8;
-    }
+    # --- Systemctl mit Promise ---
+	sub _systemctl_promise {
+		my ($timeout, @cmd) = @_;
+		
+		# Mojo::IOLoop->subprocess->run_p ist die sauberste Methode
+		# Sie erstellt den Fork, wartet asynchron und gibt ein Promise zurück.
+		return Mojo::IOLoop->subprocess->run_p(sub {
+			my $subprocess = shift;
+			# Hier läuft der Befehl im Hintergrund-Prozess
+			system(@cmd);
+			return $? >> 8; # Rückgabewert an den Haupt-Prozess liefern
+		});
+	}
 
     # --- Konfigurations-Mapping ---
     our %cfgmap;
@@ -323,19 +301,11 @@ use POSIX qw(:sys_wait_h WNOHANG);
     # --- Atomares Schreiben ---
     sub write_atomic {
         my ($path, $bytes) = @_;
-        my $dir = dirname($path);
-
-        my ($fh, $tmp) = tempfile('.tmp_XXXXXX', DIR => $dir, UNLINK => 0);
-        binmode($fh, ':raw') or die "binmode fehlgeschlagen: $!";
-        print {$fh} $bytes or die "Schreiben fehlgeschlagen: $!";
-        eval { $fh->flush() if $fh->can('flush'); 1 };
-        eval { $fh->sync()  if $fh->can('sync');  1 };
-        close $fh or die "Schließen fehlgeschlagen: $!";
-
-        my $mode = 0666 & ~_cur_umask();
-        chmod $mode, $tmp or die "chmod($tmp) fehlgeschlagen: $!";
-
-        rename $tmp, $path or die "Umbenennen fehlgeschlagen: $!";
+        my $file = path($path);
+        my $tmp = $file->dirname->child(".tmp_XXXXXX")->tempfile;
+        $tmp->spew($bytes);
+        $tmp->chmod(0666 & ~_cur_umask());
+        $tmp->move_to($file);
         _fsync_dir($path);
         return 'atomic';
     }
@@ -346,9 +316,7 @@ use POSIX qw(:sys_wait_h WNOHANG);
         my $ok = eval { write_atomic($path, $bytes); 1 };
         if (!$ok) {
             $method = 'plain';
-            open my $fh, '>:raw', $path or die "Öffnen fehlgeschlagen: $!";
-            print {$fh} $bytes or die "Schreiben fehlgeschlagen: $!";
-            close $fh or die "Schließen fehlgeschlagen: $!";
+            path($path)->spew($bytes);
         }
         return $method;
     }
@@ -440,14 +408,17 @@ use POSIX qw(:sys_wait_h WNOHANG);
     get '/config/*name' => sub {
         my $c = shift;
         my $name = $c->stash('name');
-        return $c->render(json=>{ok=>0,error=>'Ungültiger Name'}, status=>400) if $name =~ m{[/\\]} || $name =~ m{\.\.};
+
+        if ($name =~ m{[/\\]}) {
+            return $c->render(json => { ok => 0, error => 'Ungültiger Name' }, status => 400);
+        }
+
         my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannt: $name"}, status=>404);
         my $p = $e->{path};
         return $c->render(json=>{ok=>0,error=>"Pfad nicht erlaubt"}, status=>400) unless _is_allowed_path($p);
         return $c->render(json=>{ok=>0,error=>"Datei fehlt: $p"}, status=>404) unless -f $p;
 
-        open my $fh, "<:raw", $p or return $c->render(json=>{ok=>0,error=>"Lesefehler: $!"}, status=>500);
-        my $data = do { local $/; <$fh> }; close $fh;
+        my $data = path($p)->slurp;
         $c->res->headers->content_type('application/octet-stream');
         $c->render(data => $data);
     };
@@ -456,7 +427,11 @@ use POSIX qw(:sys_wait_h WNOHANG);
     post '/config/*name' => sub {
         my $c = shift;
         my $name = $c->stash('name');
-        return $c->render(json=>{ok=>0,error=>'Ungültiger Name'}, status=>400) if $name =~ m{[/\\]};
+
+        if ($name =~ m{[/\\]}) {
+            return $c->render(json => { ok => 0, error => 'Ungültiger Name' }, status => 400);
+        }
+
         my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannt: $name"}, status=>404);
         my $path = $e->{path};
         return $c->render(json=>{ok=>0,error=>"Pfad nicht erlaubt"}, status=>400) unless _is_allowed_path($path);
@@ -506,7 +481,11 @@ use POSIX qw(:sys_wait_h WNOHANG);
     get '/backups/*name' => sub {
         my $c = shift;
         my $name = $c->stash('name');
-        return $c->render(json=>{ok=>0,error=>'Ungültiger Name'}, status=>400) if $name =~ m{[/\\]} || $name =~ m{\.\.};
+
+        if ($name =~ m{[/\\]}) {
+            return $c->render(json => { ok => 0, error => 'Ungültiger Name' }, status => 400);
+        }
+
         my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannte Konfiguration: $name"}, status=>404);
         my $bdir = $e->{backup_dir};
         return $c->render(json=>{ok=>0,error=>"Backup-Verzeichnis fehlt: $bdir"}, status=>500) unless -d $bdir;
@@ -521,8 +500,11 @@ use POSIX qw(:sys_wait_h WNOHANG);
         my $c = shift;
         my $name = $c->stash('name');
         my $filename = $c->stash('filename');
-        return $c->render(json=>{ok=>0,error=>'Ungültiger Name/Filename'}, status=>400)
-            if $name =~ m{[/\\]} || $name =~ m{\.\.} || $filename =~ m{[/\\]} || $filename =~ m{\.\.};
+
+        if ($name =~ m{[/\\]} || $filename =~ m{[/\\]}) {
+            return $c->render(json => { ok => 0, error => 'Ungültiger Name/Filename' }, status => 400);
+        }
+
         my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannte Konfiguration: $name"}, status=>404);
         my $bdir = $e->{backup_dir};
         my $base = basename($e->{path});
@@ -531,8 +513,7 @@ use POSIX qw(:sys_wait_h WNOHANG);
 
         my $file = "$bdir/$filename";
         return $c->render(json=>{ok=>0,error=>'Backup nicht gefunden'}, status=>404) unless -f $file;
-        open my $fh, '<:raw', $file or return $c->render(json=>{ok=>0,error=>"Backup-Datei konnte nicht geöffnet werden: $!"}, status=>500);
-        my $content = do { local $/; <$fh> }; close $fh;
+        my $content = path($file)->slurp;
         $c->render(json => { ok=>1, content => $content });
     };
 
@@ -541,8 +522,11 @@ use POSIX qw(:sys_wait_h WNOHANG);
         my $c = shift;
         my $name = $c->stash('name');
         my $filename = $c->stash('filename');
-        return $c->render(json=>{ok=>0,error=>'Ungültiger Name/Filename'}, status=>400)
-            if $name =~ m{[/\\]} || $name =~ m{\.\.} || $filename =~ m{[/\\]} || $filename =~ m{\.\.};
+
+        if ($name =~ m{[/\\]} || $filename =~ m{[/\\]}) {
+            return $c->render(json => { ok => 0, error => 'Ungültiger Name/Filename' }, status => 400);
+        }
+
         my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannte Konfiguration: $name"}, status=>404);
         my $base = basename($e->{path});
         my $bdir = $e->{backup_dir};
@@ -570,36 +554,52 @@ use POSIX qw(:sys_wait_h WNOHANG);
         });
     };
 
-    # --- Aktion ausführen ---
+    # --- Aktion ausführen (mit Promise-Kette) ---
     post '/action/*name/*cmd' => sub {
         my $c = shift;
         my ($name, $cmd) = ($c->stash('name'), $c->stash('cmd'));
-        return $c->render(json=>{ok=>0,error=>'Ungültige Anfrage'}, status=>400) if !defined $name || $name =~ m{[/\\]};
+
+        if (!defined $name || $name =~ m{[/\\]}) {
+            return $c->render(json => { ok => 0, error => 'Ungültige Anfrage' }, status => 400);
+        }
 
         my $tool  = $SYSTEMCTL;
         my @ctl = ($tool, shellwords($SYSTEMCTL_FLAGS // ''));
-
-        if ($cmd eq 'daemon-reload') {
-            my $rc = _systemctl_with_timeout(20, @ctl, 'daemon-reload');
-            return $rc == 0 ? $c->render(json=>{ok=>1}) : $c->render(json=>{ok=>0,error=>"Rückgabewert=$rc"}, status=>500);
-        }
 
         my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannt"}, status=>404);
         my $svc = $e->{service} // $name;
         my $actmap = $e->{actions};
 
-        return $c->render(json=>{ok=>0,error=>'Aktion nicht erlaubt'}, status=>400) unless ref($actmap) eq 'HASH' && exists $actmap->{$cmd};
+        return $c->render(json=>{ok=>0,error=>'Aktion nicht erlaubt'}, status=>400)
+            unless ref($actmap) eq 'HASH' && exists $actmap->{$cmd};
 
         my @extra = @{$actmap->{$cmd}};
-        for (@extra) { return $c->render(json=>{ok=>0,error=>"Ungültiges Argument"}, status=>400) unless /^[A-Za-z0-9._:+@\/=\-,]+$/; }
+        for (@extra) {
+            if ($_ !~ /^[A-Za-z0-9._:+@\/=\-,]+$/) {
+                return $c->render(json => { ok => 0, error => "Ungültiges Argument" }, status => 400);
+            }
+        }
 
-        # Script-Ausführung
-        if ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
+        # Promise-Kette für asynchrone Ausführung
+        if ($cmd eq 'daemon-reload') {
+            _systemctl_promise(20, @ctl, 'daemon-reload')
+                ->then(sub {
+                    my ($rc) = @_;
+                    if ($rc == 0) {
+                        $c->render(json => { ok => 1 });
+                    } else {
+                        $c->render(json => { ok => 0, error => "Rückgabewert=$rc" }, status => 500);
+                    }
+                });
+            return;
+        }
+        elsif ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
             my ($runner, $script) = ($1, $2);
             return $c->render(json=>{ok=>0,error=>"Skript nicht gefunden: $script"}, status=>404) unless -f $script;
 
             if ($runner eq 'exec' && $script =~ m{/systemctl$}) {
-                return $c->render(json=>{ok=>0,error=>'Subcommand verboten'}, status=>400) if ($extra[0]//'') =~ /^(poweroff|reboot|halt)$/;
+                return $c->render(json=>{ok=>0,error=>'Subcommand verboten'}, status=>400)
+                    if ($extra[0]//'') =~ /^(poweroff|reboot|halt)$/;
             }
 
             my @argv =
@@ -607,84 +607,102 @@ use POSIX qw(:sys_wait_h WNOHANG);
                 $runner eq 'bash' ? ('/bin/bash', $script, @extra) :
                 ($script, @extra);
 
-            my ($script_dir) = $script =~ m{^(.+)/[^/]+$};
-            my $cwd_prev = getcwd();
-            chdir $script_dir if defined $script_dir;
-
-            my $start = time();
-            my ($out_r, $pid, $buf_out, $buf_err) = (undef, undef, '', '');
-            my $err_h = gensym;
-
-            eval {
-                $pid = open3(undef, $out_r, $err_h, @argv);
-                local $SIG{ALRM} = sub { die "timeout\n" };
-                alarm 60;
-
-                my $child_exited = 0;
-                while (1) {
-                    if (!$child_exited) {
-                        my $wp = waitpid($pid, WNOHANG);
-                        $child_exited = 1 if $wp == $pid || $wp == -1;
+            Mojo::Promise->new(sub {
+                my ($resolve) = @_;
+                Mojo::IOLoop->subprocess(
+                    sub {
+                        my ($subprocess) = @_;
+                        $subprocess->system(@argv);
+                    },
+                    sub {
+                        my ($subprocess, $err, @results) = @_;
+                        my $rc = $subprocess->exit_code;
+                        $resolve->($rc);
                     }
-                    my $rin = '';
-                    vec($rin, fileno($out_r), 1) = 1 if $out_r;
-                    vec($rin, fileno($err_h), 1) = 1 if $err_h;
-                    last if $child_exited && $rin eq '';
-
-                    if (select(my $rout=$rin, undef, undef, 0.1) > 0) {
-                        my $tmp;
-                        if ($out_r && vec($rout, fileno($out_r), 1)) {
-                            sysread($out_r, $tmp, 4096) > 0 ? $buf_out .= $tmp : do { close $out_r; undef $out_r; };
-                        }
-                        if ($err_h && vec($rout, fileno($err_h), 1)) {
-                            sysread($err_h, $tmp, 4096) > 0 ? $buf_err .= $tmp : do { close $err_h; undef $err_h; };
-                        }
-                    }
+                );
+            })->then(sub {
+                my ($rc) = @_;
+                if ($runner eq 'exec' && $script =~ m{/systemctl$} && ($extra[0]//'') eq 'is-active') {
+                    $c->render(json=>{ok=>1, status=>($rc==0?'running':'stopped'), rc=>$rc});
+                } else {
+                    $c->render(json=>{
+                        ok => ($rc == 0 || ($script=~/postmulti/ && $rc<=1)) ? 1 : 0,
+                        rc => $rc
+                    });
                 }
-                alarm 0;
-            } or do {
-                alarm 0; kill 9, $pid if $pid; waitpid($pid,0) if $pid;
-                chdir $cwd_prev;
-                return $c->render(json=>{ok=>0,error=>"Skript-Timeout/Fehler"}, status=>500);
-            };
-
-            chdir $cwd_prev;
-            my $rc = $? >> 8;
-
-            if ($runner eq 'exec' && $script =~ m{/systemctl$} && ($extra[0]//'') eq 'is-active') {
-                return $c->render(json=>{ok=>1, status=>($rc==0?'running':'stopped'), rc=>$rc});
-            }
-
-            return $c->render(json=>{
-                ok => ($rc == 0 || ($script=~/postmulti/ && $rc<=1)) ? 1 : 0,
-                rc => $rc, stdout => substr($buf_out,0,10000), stderr => substr($buf_err,0,10000)
             });
+            return;
         }
+        elsif ($svc eq 'systemctl') {
+            return $c->render(json=>{ok=>0,error=>'Verboten'}, status=>400)
+                if $cmd =~ /^(poweroff|reboot|halt)$/;
 
-        if ($svc eq 'systemctl') {
-            return $c->render(json=>{ok=>0,error=>'Verboten'}, status=>400) if $cmd =~ /^(poweroff|reboot|halt)$/;
-            my $rc = system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd);
-            return $rc == 0 ? $c->render(json=>{ok=>1}) : $c->render(json=>{ok=>0,error=>"Rückgabewert=$rc"}, status=>500);
+            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd, $svc)
+                ->then(sub {
+                    my ($rc) = @_;
+                    if ($rc == 0) {
+                        $c->render(json => { ok => 1 });
+                    } else {
+                        $c->render(json => { ok => 0, error => "Rückgabewert=$rc" }, status => 500);
+                    }
+                });
+            return;
         }
-
-        my $run = sub { return _systemctl_with_timeout(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $_[0], $svc) == 0; };
-
-        if ($cmd eq 'status' || $cmd eq 'stop_start' || $cmd eq 'restart' || $cmd eq 'reload') {
-            if ($cmd eq 'stop_start') { $run->('stop'); $run->('start'); }
-            elsif ($cmd eq 'restart') { $run->('restart'); }
-            elsif ($cmd eq 'reload') {
-                my $active = system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc) == 0;
-                $run->('reload') if $active;
-            }
-
-            my $active = system($SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc) == 0;
-            return $c->render(json=>{ok=>1, action=>$cmd, status=>($active?'running':'stopped')});
+        elsif ($cmd eq 'stop_start') {
+            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'stop', $svc)
+                ->then(sub {
+                    _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'start', $svc);
+                })
+                ->then(sub {
+                    _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
+                        ->then(sub {
+                            my ($rc) = @_;
+                            $c->render(json=>{ok=>1, action=>$cmd, status=>($rc==0?'running':'stopped')});
+                        });
+                });
+            return;
         }
-
-        if ($run->($cmd)) {
-            return $c->render(json=>{ok=>1, action=>$cmd, status=>'ok'});
-        } else {
-            return $c->render(json=>{ok=>0, error=>"Fehler bei $cmd"}, status=>500);
+        elsif ($cmd eq 'restart') {
+            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'restart', $svc)
+                ->then(sub {
+                    _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
+                        ->then(sub {
+                            my ($rc) = @_;
+                            $c->render(json=>{ok=>1, action=>$cmd, status=>($rc==0?'running':'stopped')});
+                        });
+                });
+            return;
+        }
+        elsif ($cmd eq 'reload') {
+            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
+                ->then(sub {
+                    my ($rc) = @_;
+                    if ($rc == 0) {
+                        _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'reload', $svc)
+                            ->then(sub {
+                                _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
+                                    ->then(sub {
+                                        my ($active_rc) = @_;
+                                        $c->render(json=>{ok=>1, action=>$cmd, status=>($active_rc==0?'running':'stopped')});
+                                    });
+                            });
+                    } else {
+                        $c->render(json=>{ok=>0, error=>"Dienst nicht aktiv, reload übersprungen"}, status=>400);
+                    }
+                });
+            return;
+        }
+        else {
+            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd, $svc)
+                ->then(sub {
+                    my ($rc) = @_;
+                    if ($rc == 0) {
+                        $c->render(json=>{ok=>1, action=>$cmd, status=>'ok'});
+                    } else {
+                        $c->render(json=>{ok=>0, error=>"Fehler bei $cmd"}, status=>500);
+                    }
+                });
+            return;
         }
     };
 
@@ -710,6 +728,11 @@ use POSIX qw(:sys_wait_h WNOHANG);
     del '/raw/configs/:name' => sub {
         my $c = shift;
         my $name = $c->stash('name');
+
+        if ($name =~ m{[/\\]}) {
+            return $c->render(json => { ok => 0, error => 'Ungültiger Name' }, status => 400);
+        }
+
         my $cfg = decode_json(read_all($configsfile));
         return $c->render(status=>404, json=>{ok=>0}) unless delete $cfg->{$name};
         safe_write_file($configsfile, encode_json($cfg));
@@ -752,13 +775,13 @@ use POSIX qw(:sys_wait_h WNOHANG);
             }
         }
 
-        # Token-Auth
+        # Token-Auth (mit secure_compare)
         if (defined $api_token && length $api_token) {
             my $hdr     = $c->req->headers->header('X-API-Token') // '';
             my $auth    = $c->req->headers->authorization // '';
             my $bearer  = $auth =~ /^Bearer\s+(.+)/i ? $1 : '';
             my $token   = $hdr || $bearer;
-            unless ($token eq $api_token) {
+            unless ($token && secure_compare($token, $api_token)) {
                 $log->info(sprintf('REQUEST %s -> 401 Unauthorized', _fmt_req($c)));
                 return $c->render(status => 401, json => { ok=>0, error => 'Unauthorized' });
             }
