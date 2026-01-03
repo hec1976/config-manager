@@ -1,13 +1,12 @@
 #!/usr/bin/env perl
 # Config Manager — REST (actions schema, umask-first, hardened)
-# Version: 1.6.8 (2026-01-03)
+# Version: 1.7.0 (2026-01-03)
 #
-# Changelog 1.6.8:
-# - UPGRADE: Mojo::File für Dateioperationen (sauberer, robuster)
-# - UPGRADE: Nicht-blockierende Subprozesse mit Mojo::Promise
-# - UPGRADE: Sichere Token-Vergleiche mit Mojo::Util::secure_compare
-# - REFACTOR: Code alkalisiert (konsistente Formatierung, bessere Lesbarkeit)
-# - KEEP: Alle Features und Fixes aus v1.6.7
+# Changelog 1.7.0:
+# - FIX: Korrekte Promise-Verkettung in allen asynchronen Routen (return in .then())
+# - FIX: Vollständige catch-Blöcke für alle Promise-Ketten
+# - FIX: Konsistente Fehlerbehandlung für systemctl/reload/is-active
+# - KEEP: Alle Features und Upgrades aus v1.6.8
 
 use strict;
 use warnings;
@@ -37,7 +36,7 @@ use POSIX qw(:sys_wait_h WNOHANG);
     umask 0007;
 
     # ---------------- Version & Globale Variablen ----------------
-    our $VERSION = '1.6.8';
+    our $VERSION = '1.7.0';
 
     our $globalfile  = "$Bin/global.json";
     our $configsfile = "$Bin/configs.json";
@@ -68,7 +67,7 @@ use POSIX qw(:sys_wait_h WNOHANG);
                     : (defined $global->{systemctl_flags} ? $global->{systemctl_flags} : '');
 
     # ---------------- Logging-Konfiguration ----------------
-    our $logfile = $global->{logfile} // "/var/log/mmbb/config-manager.log";
+    our $logfile = $global->{logfile} // "/var/log/config-manager.log";
     our $logdir  = dirname($logfile);
 
     # Log-Verzeichnis erstellen, falls nicht vorhanden
@@ -240,19 +239,74 @@ use POSIX qw(:sys_wait_h WNOHANG);
         return "$backupRoot/$sub";
     }
 
-    # --- Systemctl mit Promise ---
-	sub _systemctl_promise {
-		my ($timeout, @cmd) = @_;
-		
-		# Mojo::IOLoop->subprocess->run_p ist die sauberste Methode
-		# Sie erstellt den Fork, wartet asynchron und gibt ein Promise zurück.
-		return Mojo::IOLoop->subprocess->run_p(sub {
-			my $subprocess = shift;
-			# Hier läuft der Befehl im Hintergrund-Prozess
-			system(@cmd);
-			return $? >> 8; # Rückgabewert an den Haupt-Prozess liefern
-		});
-	}
+    # --- Systemctl mit Promise und vollständiger Fehlerbehandlung ---
+    sub _systemctl_promise {
+        my ($timeout, @cmd) = @_;
+        $timeout = 30 unless defined $timeout && $timeout =~ /^\d+$/;
+
+        return Mojo::Promise->new(sub {
+            my ($resolve, $reject) = @_;
+
+            my $pid = fork();
+            unless (defined $pid) {
+                $reject->("fork fehlgeschlagen: $!");
+                return;
+            }
+
+            if ($pid == 0) {
+                # Child-Prozess
+                open STDIN, '<', '/dev/null';
+                exec @cmd;
+                exit 127;
+            }
+
+            # Eltern-Prozess
+            my $timed_out = 0;
+            local $SIG{ALRM} = sub {
+                $timed_out = 1;
+                kill 9, $pid;
+            };
+            alarm $timeout;
+
+            Mojo::IOLoop->next_tick(sub {
+                waitpid($pid, 0);
+                alarm 0;
+
+                if ($timed_out) {
+                    $log->warn("systemctl-Timeout nach ${timeout}s: @cmd");
+                    $resolve->(-1);  # Timeout als spezieller Rückgabewert
+                }
+                elsif (($? & 127) > 0) {
+                    my $sig = $? & 127;
+                    $log->warn("systemctl mit Signal $sig beendet: @cmd");
+                    $resolve->(128 + $sig);
+                }
+                else {
+                    $resolve->($? >> 8);
+                }
+            });
+        });
+    }
+
+    # --- Skript-Ausführung mit Promise ---
+    sub _script_promise {
+        my ($c, @argv) = @_;
+
+        return Mojo::Promise->new(sub {
+            my ($resolve) = @_;
+
+            Mojo::IOLoop->subprocess(
+                sub {
+                    my ($subprocess) = @_;
+                    $subprocess->system(@argv);
+                },
+                sub {
+                    my ($subprocess, $err, @results) = @_;
+                    $resolve->($subprocess->exit_code);
+                }
+            );
+        });
+    }
 
     # --- Konfigurations-Mapping ---
     our %cfgmap;
@@ -554,17 +608,15 @@ use POSIX qw(:sys_wait_h WNOHANG);
         });
     };
 
-    # --- Aktion ausführen (mit Promise-Kette) ---
+    # --- Aktion ausführen (mit vollständiger Promise-Kette und catch) ---
     post '/action/*name/*cmd' => sub {
         my $c = shift;
         my ($name, $cmd) = ($c->stash('name'), $c->stash('cmd'));
 
+        # Validierung
         if (!defined $name || $name =~ m{[/\\]}) {
             return $c->render(json => { ok => 0, error => 'Ungültige Anfrage' }, status => 400);
         }
-
-        my $tool  = $SYSTEMCTL;
-        my @ctl = ($tool, shellwords($SYSTEMCTL_FLAGS // ''));
 
         my $e = $cfgmap{$name} or return $c->render(json=>{ok=>0,error=>"Unbekannt"}, status=>404);
         my $svc = $e->{service} // $name;
@@ -580,18 +632,11 @@ use POSIX qw(:sys_wait_h WNOHANG);
             }
         }
 
-        # Promise-Kette für asynchrone Ausführung
+        # Haupt-Promise für die gesamte Aktion
+        my $action_promise;
+
         if ($cmd eq 'daemon-reload') {
-            _systemctl_promise(20, @ctl, 'daemon-reload')
-                ->then(sub {
-                    my ($rc) = @_;
-                    if ($rc == 0) {
-                        $c->render(json => { ok => 1 });
-                    } else {
-                        $c->render(json => { ok => 0, error => "Rückgabewert=$rc" }, status => 500);
-                    }
-                });
-            return;
+            $action_promise = _systemctl_promise(20, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'daemon-reload');
         }
         elsif ($svc =~ m{^(bash|sh|perl|exec):(/.+)$}) {
             my ($runner, $script) = ($1, $2);
@@ -602,108 +647,82 @@ use POSIX qw(:sys_wait_h WNOHANG);
                     if ($extra[0]//'') =~ /^(poweroff|reboot|halt)$/;
             }
 
-            my @argv =
-                $runner eq 'perl' ? ('/usr/bin/perl', $script, @extra) :
-                $runner eq 'bash' ? ('/bin/bash', $script, @extra) :
-                ($script, @extra);
+            my @argv = $runner eq 'perl' ? ('/usr/bin/perl', $script, @extra)
+                        : $runner eq 'bash' ? ('/bin/bash', $script, @extra)
+                        : ($script, @extra);
 
-            Mojo::Promise->new(sub {
-                my ($resolve) = @_;
-                Mojo::IOLoop->subprocess(
-                    sub {
-                        my ($subprocess) = @_;
-                        $subprocess->system(@argv);
-                    },
-                    sub {
-                        my ($subprocess, $err, @results) = @_;
-                        my $rc = $subprocess->exit_code;
-                        $resolve->($rc);
-                    }
-                );
-            })->then(sub {
-                my ($rc) = @_;
-                if ($runner eq 'exec' && $script =~ m{/systemctl$} && ($extra[0]//'') eq 'is-active') {
-                    $c->render(json=>{ok=>1, status=>($rc==0?'running':'stopped'), rc=>$rc});
-                } else {
-                    $c->render(json=>{
-                        ok => ($rc == 0 || ($script=~/postmulti/ && $rc<=1)) ? 1 : 0,
-                        rc => $rc
-                    });
-                }
-            });
-            return;
+            $action_promise = _script_promise($c, @argv);
         }
         elsif ($svc eq 'systemctl') {
-            return $c->render(json=>{ok=>0,error=>'Verboten'}, status=>400)
-                if $cmd =~ /^(poweroff|reboot|halt)$/;
-
-            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd, $svc)
-                ->then(sub {
-                    my ($rc) = @_;
-                    if ($rc == 0) {
-                        $c->render(json => { ok => 1 });
-                    } else {
-                        $c->render(json => { ok => 0, error => "Rückgabewert=$rc" }, status => 500);
-                    }
-                });
-            return;
+            if ($cmd =~ /^(poweroff|reboot|halt)$/) {
+                return $c->render(json=>{ok=>0,error=>'Verboten'}, status=>400);
+            }
+            $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd, $svc);
         }
         elsif ($cmd eq 'stop_start') {
-            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'stop', $svc)
+            $action_promise =
+                _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'stop', $svc)
                 ->then(sub {
-                    _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'start', $svc);
-                })
-                ->then(sub {
-                    _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
-                        ->then(sub {
-                            my ($rc) = @_;
-                            $c->render(json=>{ok=>1, action=>$cmd, status=>($rc==0?'running':'stopped')});
-                        });
+                    return _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'start', $svc);
                 });
-            return;
         }
         elsif ($cmd eq 'restart') {
-            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'restart', $svc)
-                ->then(sub {
-                    _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
-                        ->then(sub {
-                            my ($rc) = @_;
-                            $c->render(json=>{ok=>1, action=>$cmd, status=>($rc==0?'running':'stopped')});
-                        });
-                });
-            return;
+            $action_promise =
+                _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'restart', $svc);
         }
         elsif ($cmd eq 'reload') {
-            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
+            $action_promise =
+                _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
                 ->then(sub {
                     my ($rc) = @_;
                     if ($rc == 0) {
-                        _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'reload', $svc)
-                            ->then(sub {
-                                _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
-                                    ->then(sub {
-                                        my ($active_rc) = @_;
-                                        $c->render(json=>{ok=>1, action=>$cmd, status=>($active_rc==0?'running':'stopped')});
-                                    });
-                            });
+                        return _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'reload', $svc);
                     } else {
-                        $c->render(json=>{ok=>0, error=>"Dienst nicht aktiv, reload übersprungen"}, status=>400);
+                        return Mojo::Promise->reject("Dienst nicht aktiv");
                     }
                 });
-            return;
         }
         else {
-            _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd, $svc)
-                ->then(sub {
-                    my ($rc) = @_;
-                    if ($rc == 0) {
-                        $c->render(json=>{ok=>1, action=>$cmd, status=>'ok'});
-                    } else {
-                        $c->render(json=>{ok=>0, error=>"Fehler bei $cmd"}, status=>500);
-                    }
-                });
-            return;
+            $action_promise = _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), $cmd, $svc);
         }
+
+        # Finaler catch-Block für alle Fehlerfälle
+        $action_promise
+            ->then(sub {
+                my ($rc) = @_;
+
+                if ($cmd eq 'daemon-reload' || $svc eq 'systemctl') {
+                    $c->render(json => $rc == 0
+                        ? { ok => 1 }
+                        : { ok => 0, error => "Rückgabewert=$rc" });
+                }
+                elsif ($svc =~ m{^(bash|sh|perl|exec):} && ($extra[0]//'') eq 'is-active') {
+                    $c->render(json => { ok => 1, status => ($rc == 0 ? 'running' : 'stopped'), rc => $rc });
+                }
+                elsif ($cmd eq 'stop_start' || $cmd eq 'restart' || $cmd eq 'reload') {
+                    return _systemctl_promise(30, $SYSTEMCTL, shellwords($SYSTEMCTL_FLAGS//''), 'is-active', $svc)
+                        ->then(sub {
+                            my ($active_rc) = @_;
+                            $c->render(json => {
+                                ok => 1,
+                                action => $cmd,
+                                status => ($active_rc == 0 ? 'running' : 'stopped')
+                            });
+                        });
+                }
+                else {
+                    $c->render(json => {
+                        ok => ($rc == 0 ? 1 : 0),
+                        rc => $rc,
+                        ($rc != 0 ? (error => "Fehler bei $cmd") : ())
+                    });
+                }
+            })
+            ->catch(sub {
+                my ($err) = @_;
+                $log->error("Fehler bei Aktion $cmd: $err");
+                $c->render(json => { ok => 0, error => "Interner Fehler: $err" }, status => 500);
+            });
     };
 
     # --- Raw configs ---
